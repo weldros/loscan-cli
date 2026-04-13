@@ -1,0 +1,5 @@
+error/
+auth/
+scripts/__pycache__/
+/.venv/
+/instance
