@@ -7,6 +7,7 @@ import re
 import sqlite3
 import time
 from collections import defaultdict
+from dataclasses import dataclass, field
 from datetime import datetime
 from html import escape
 from pathlib import Path
@@ -47,6 +48,15 @@ def resolve_report_base(log_path: Path, output_dir: Path | None = None, explicit
 		return explicit_path.with_suffix("")
 	base_dir = output_dir if output_dir is not None else default_error_report_dir(log_path)
 	return base_dir / f"{log_path.stem}_error_report"
+
+
+def normalize_requested_formats(requested_formats: list[str] | None) -> list[str]:
+	if not requested_formats:
+		return list(SUPPORTED_FORMATS)
+
+	normalized = [fmt.strip().lower() for fmt in requested_formats if fmt.strip()]
+	valid = [fmt for fmt in normalized if fmt in SUPPORTED_FORMATS]
+	return valid if valid else list(SUPPORTED_FORMATS)
 
 
 def _summary_payload(summary: ScanSummary) -> dict[str, Any]:
@@ -126,70 +136,31 @@ def _is_malicious_for_ip(finding: Finding) -> bool:
 	return finding.category in MALICIOUS_IP_CATEGORIES or finding.severity == "critical"
 
 
-def build_dashboard_metrics(
-	summary: ScanSummary,
-	iter_findings: Callable[[], Iterable[Finding]],
-	script_runtime_seconds: float | None = None,
-) -> dict[str, Any]:
+@dataclass
+class DashboardMetricAccumulator:
 	first_ts: datetime | None = None
 	last_ts: datetime | None = None
-	for finding in iter_findings():
+	event_records: list[tuple[datetime, bool, int]] = field(default_factory=list)
+	ip_stats: dict[str, dict[str, Any]] = field(default_factory=dict)
+	ip_category_counts: dict[tuple[str, str], int] = field(default_factory=lambda: defaultdict(int))
+	error_phrase_counts: dict[str, int] = field(default_factory=lambda: defaultdict(int))
+	top_attack_patterns: list[str] = field(default_factory=list)
+
+	def consume(self, finding: Finding) -> None:
 		parsed = parse_timestamp_text(finding.timestamp)
-		if parsed is None:
-			continue
-		if first_ts is None or parsed < first_ts:
-			first_ts = parsed
-		if last_ts is None or parsed > last_ts:
-			last_ts = parsed
+		is_malicious = _is_malicious_for_ip(finding)
+		gap_seconds = _extract_gap_seconds(finding) if finding.category == "time_gap" else 0
 
-	log_span_seconds = int((last_ts - first_ts).total_seconds()) if first_ts and last_ts else 0
-	display_runtime_seconds = max(0.0, float(script_runtime_seconds)) if script_runtime_seconds is not None else float(log_span_seconds)
-	interval_count = DASHBOARD_INTERVAL_COUNT
-	interval_seconds = max(1, log_span_seconds // interval_count) if log_span_seconds > 0 else 1
-
-	buckets: list[dict[str, Any]] = []
-	if first_ts and last_ts:
-		for idx in range(interval_count):
-			start = first_ts + (idx * (last_ts - first_ts) / interval_count)
-			end = first_ts + ((idx + 1) * (last_ts - first_ts) / interval_count)
-			buckets.append(
-				{
-					"index": idx,
-					"interval_start": start.isoformat(),
-					"interval_end": end.isoformat(),
-					"total_events": 0,
-					"malicious_events": 0,
-					"downtime_seconds": 0,
-					"uptime_percent": 100.0,
-				}
-			)
-
-	def bucket_index(ts: datetime) -> int:
-		if not first_ts or log_span_seconds <= 0:
-			return 0
-		offset = int((ts - first_ts).total_seconds())
-		raw = (offset * interval_count) // max(1, log_span_seconds)
-		return min(interval_count - 1, max(0, raw))
-
-	ip_stats: dict[str, dict[str, Any]] = {}
-	ip_category_counts: dict[tuple[str, str], int] = defaultdict(int)
-	error_phrase_counts: dict[str, int] = defaultdict(int)
-	top_attack_patterns: list[str] = []
-
-	for finding in iter_findings():
-		parsed = parse_timestamp_text(finding.timestamp)
-		if parsed is not None and buckets:
-			idx = bucket_index(parsed)
-			bucket = buckets[idx]
-			bucket["total_events"] += 1
-			if _is_malicious_for_ip(finding):
-				bucket["malicious_events"] += 1
-			if finding.category == "time_gap":
-				bucket["downtime_seconds"] += _extract_gap_seconds(finding)
+		if parsed is not None:
+			if self.first_ts is None or parsed < self.first_ts:
+				self.first_ts = parsed
+			if self.last_ts is None or parsed > self.last_ts:
+				self.last_ts = parsed
+			self.event_records.append((parsed, is_malicious, gap_seconds))
 
 		for ip in _split_ips(finding.ip_address):
-			if ip not in ip_stats:
-				ip_stats[ip] = {
+			if ip not in self.ip_stats:
+				self.ip_stats[ip] = {
 					"ip_address": ip,
 					"total_requests": 0,
 					"malicious_request_count": 0,
@@ -198,9 +169,9 @@ def build_dashboard_metrics(
 					"first_seen": None,
 					"last_seen": None,
 				}
-			entry = ip_stats[ip]
+			entry = self.ip_stats[ip]
 			entry["total_requests"] += 1
-			if _is_malicious_for_ip(finding):
+			if is_malicious:
 				entry["malicious_request_count"] += 1
 			if finding.severity == "critical":
 				entry["critical_findings"] += 1
@@ -210,146 +181,175 @@ def build_dashboard_metrics(
 				iso = parsed.isoformat()
 				entry["first_seen"] = iso if entry["first_seen"] is None or iso < entry["first_seen"] else entry["first_seen"]
 				entry["last_seen"] = iso if entry["last_seen"] is None or iso > entry["last_seen"] else entry["last_seen"]
-			ip_category_counts[(ip, finding.category)] += 1
+			self.ip_category_counts[(ip, finding.category)] += 1
 
 		for phrase in finding.matched_phrases:
-			error_phrase_counts[phrase] += 1
+			self.error_phrase_counts[phrase] += 1
 
-		if finding.category == "attack_pattern" and len(top_attack_patterns) < 10:
-			top_attack_patterns.append(finding.message)
+		if finding.category == "attack_pattern" and len(self.top_attack_patterns) < 10:
+			self.top_attack_patterns.append(finding.message)
 
-	for bucket in buckets:
-		downtime = min(bucket["downtime_seconds"], interval_seconds)
-		bucket["uptime_percent"] = round(max(0.0, 100.0 - (downtime / interval_seconds * 100.0)), 2)
+	def finalize(self, summary: ScanSummary, script_runtime_seconds: float | None = None) -> dict[str, Any]:
+		log_span_seconds = int((self.last_ts - self.first_ts).total_seconds()) if self.first_ts and self.last_ts else 0
+		display_runtime_seconds = max(0.0, float(script_runtime_seconds)) if script_runtime_seconds is not None else float(log_span_seconds)
+		interval_count = DASHBOARD_INTERVAL_COUNT
+		interval_seconds = max(1, log_span_seconds // interval_count) if log_span_seconds > 0 else 1
 
-	ip_metrics = sorted(
-		ip_stats.values(),
-		key=lambda item: (item["malicious_request_count"], item["total_requests"], item["critical_findings"]),
-		reverse=True,
-	)
-	error_phrase_frequency = [
-		{"phrase": phrase, "occurrences": count}
-		for phrase, count in sorted(error_phrase_counts.items(), key=lambda item: item[1], reverse=True)
-	]
-	ip_error_correlation = [
-		{"ip_address": ip, "category": category, "occurrences": count}
-		for (ip, category), count in sorted(ip_category_counts.items(), key=lambda item: item[1], reverse=True)
-	]
+		buckets: list[dict[str, Any]] = []
+		if self.first_ts and self.last_ts:
+			span = self.last_ts - self.first_ts
+			for idx in range(interval_count):
+				start = self.first_ts + (idx * span / interval_count)
+				end = self.first_ts + ((idx + 1) * span / interval_count)
+				buckets.append(
+					{
+						"index": idx,
+						"interval_start": start.isoformat(),
+						"interval_end": end.isoformat(),
+						"total_events": 0,
+						"malicious_events": 0,
+						"downtime_seconds": 0,
+						"uptime_percent": 100.0,
+					}
+				)
 
-	total_downtime_seconds = sum(bucket["downtime_seconds"] for bucket in buckets)
-	availability_percent = 100.0
-	if log_span_seconds > 0:
-		availability_percent = round(
-			max(0.0, 100.0 - ((min(total_downtime_seconds, log_span_seconds) / log_span_seconds) * 100.0)),
-			2,
+		def bucket_index(ts: datetime) -> int:
+			if not self.first_ts or log_span_seconds <= 0:
+				return 0
+			offset = int((ts - self.first_ts).total_seconds())
+			raw = (offset * interval_count) // max(1, log_span_seconds)
+			return min(interval_count - 1, max(0, raw))
+
+		for parsed, is_malicious, gap_seconds in self.event_records:
+			if buckets:
+				idx = bucket_index(parsed)
+				bucket = buckets[idx]
+				bucket["total_events"] += 1
+				if is_malicious:
+					bucket["malicious_events"] += 1
+				if gap_seconds:
+					bucket["downtime_seconds"] += gap_seconds
+
+		for bucket in buckets:
+			downtime = min(bucket["downtime_seconds"], interval_seconds)
+			bucket["uptime_percent"] = round(max(0.0, 100.0 - (downtime / interval_seconds * 100.0)), 2)
+
+		ip_metrics = sorted(
+			self.ip_stats.values(),
+			key=lambda item: (item["malicious_request_count"], item["total_requests"], item["critical_findings"]),
+			reverse=True,
 		)
+		error_phrase_frequency = [
+			{"phrase": phrase, "occurrences": count}
+			for phrase, count in sorted(self.error_phrase_counts.items(), key=lambda item: item[1], reverse=True)
+		]
+		ip_error_correlation = [
+			{"ip_address": ip, "category": category, "occurrences": count}
+			for (ip, category), count in sorted(self.ip_category_counts.items(), key=lambda item: item[1], reverse=True)
+		]
 
-	return {
-		"trend_metadata": {
-			"source_file": summary.file,
-			"runtime_seconds": display_runtime_seconds,
-			"log_span_seconds": log_span_seconds,
-			"first_timestamp": first_ts.isoformat() if first_ts else None,
-			"last_timestamp": last_ts.isoformat() if last_ts else None,
-			"interval_count": interval_count,
-			"interval_seconds": interval_seconds,
-			"availability_percent": availability_percent,
-			"time_gap_count_gt500": summary.time_gap_count_gt500,
-			"time_gap_count_gt300": summary.time_gap_count_gt300,
-		},
-		"time_series": buckets,
-		"uptime_trend": [
-			{"x_seconds": idx * interval_seconds, "uptime_percent": bucket["uptime_percent"]}
-			for idx, bucket in enumerate(buckets)
-		],
-		"ip_request_metrics": ip_metrics,
-		"ip_filtering": {
-			"filter_field": "malicious_request_count",
-			"description": "Filter IPs by malicious request volume to detect potential hacking attempts",
-		},
-		"error_phrase_frequency": error_phrase_frequency,
-		"ip_error_correlation": ip_error_correlation,
-		"top_findings": {
-			"top_ips": ip_metrics[:10],
-			"top_error_phrases": error_phrase_frequency[:10],
-			"top_attack_patterns": top_attack_patterns,
-		},
-	}
+		total_downtime_seconds = sum(bucket["downtime_seconds"] for bucket in buckets)
+		availability_percent = 100.0
+		if log_span_seconds > 0:
+			availability_percent = round(
+				max(0.0, 100.0 - ((min(total_downtime_seconds, log_span_seconds) / log_span_seconds) * 100.0)),
+				2,
+			)
 
-
-def write_dashboard_metrics_json(path: Path, metrics: dict[str, Any]) -> Path:
-	out = unique_report_path(path, ".json")
-	out.parent.mkdir(parents=True, exist_ok=True)
-	out.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
-	return out
-
-
-def write_json_report(path: Path, summary: ScanSummary, iter_findings: Callable[[], Iterable[Finding]]) -> Path:
-	by_category: dict[str, int] = {}
-	total_errors = 0
-	for finding in iter_findings():
-		by_category[finding.category] = by_category.get(finding.category, 0) + 1
-		total_errors += 1
-
-	out = unique_report_path(path, ".json")
-	out.parent.mkdir(parents=True, exist_ok=True)
-	with out.open("w", encoding="utf-8") as handle:
-		handle.write("{\n")
-		handle.write(f'  "source_file": {json.dumps(summary.file)},\n')
-		handle.write(f'  "total_lines": {summary.total_lines},\n')
-		handle.write(f'  "total_errors": {total_errors},\n')
-		handle.write(f'  "errors_by_category": {json.dumps(by_category)},\n')
-		handle.write(f'  "errors_by_severity": {json.dumps(summary.severity_breakdown)},\n')
-		handle.write(f'  "summary": {json.dumps(_summary_payload(summary))},\n')
-		handle.write('  "errors": [\n')
-		first = True
-		for finding in iter_findings():
-			if not first:
-				handle.write(",\n")
-			handle.write(f"    {json.dumps(_finding_to_dict(finding))}")
-			first = False
-		handle.write("\n  ]\n}\n")
-	return out
+		return {
+			"trend_metadata": {
+				"source_file": summary.file,
+				"runtime_seconds": display_runtime_seconds,
+				"log_span_seconds": log_span_seconds,
+				"first_timestamp": self.first_ts.isoformat() if self.first_ts else None,
+				"last_timestamp": self.last_ts.isoformat() if self.last_ts else None,
+				"interval_count": interval_count,
+				"interval_seconds": interval_seconds,
+				"availability_percent": availability_percent,
+				"time_gap_count_gt500": summary.time_gap_count_gt500,
+				"time_gap_count_gt300": summary.time_gap_count_gt300,
+			},
+			"time_series": buckets,
+			"uptime_trend": [
+				{"x_seconds": idx * interval_seconds, "uptime_percent": bucket["uptime_percent"]}
+				for idx, bucket in enumerate(buckets)
+			],
+			"ip_request_metrics": ip_metrics,
+			"ip_filtering": {
+				"filter_field": "malicious_request_count",
+				"description": "Filter IPs by malicious request volume to detect potential hacking attempts",
+			},
+			"error_phrase_frequency": error_phrase_frequency,
+			"ip_error_correlation": ip_error_correlation,
+			"top_findings": {
+				"top_ips": ip_metrics[:10],
+				"top_error_phrases": error_phrase_frequency[:10],
+				"top_attack_patterns": self.top_attack_patterns,
+			},
+		}
 
 
-def write_csv_report(path: Path, iter_findings: Callable[[], Iterable[Finding]]) -> Path:
-	out = unique_report_path(path, ".csv")
-	out.parent.mkdir(parents=True, exist_ok=True)
-	with out.open("w", encoding="utf-8", newline="") as handle:
-		writer = csv.writer(handle)
-		writer.writerow(["line_number", "category", "severity", "score", "timestamp", "ip_address", "matched_phrases", "message"])
-		for finding in iter_findings():
-			writer.writerow([
-				finding.line_number,
-				finding.category,
-				finding.severity,
-				finding.score,
-				finding.timestamp or "",
-				finding.ip_address or "",
-				";".join(finding.matched_phrases),
-				finding.message,
-			])
-	return out
+class StreamingReportWriter:
+	def __init__(
+		self,
+		log_path: Path,
+		requested_formats: list[str] | None = None,
+		output_dir: Path | None = None,
+		explicit_path: Path | None = None,
+		report_username: str | None = None,
+		report_password: str | None = None,
+		include_dashboard_metrics: bool = False,
+		script_start_time: float | None = None,
+	) -> None:
+		self.log_path = log_path
+		self.base = resolve_report_base(log_path, output_dir=output_dir, explicit_path=explicit_path)
+		self.formats = normalize_requested_formats(requested_formats)
+		self.report_username = report_username
+		self.report_password = report_password
+		self.include_dashboard_metrics = include_dashboard_metrics or "db" in self.formats
+		self.script_start_time = script_start_time
+		self.accumulator = DashboardMetricAccumulator()
+		self.outputs: dict[str, Path] = {}
+		self._json_handle = None
+		self._json_first = True
+		self._csv_writer = None
+		self._csv_handle = None
+		self._html_handle = None
+		self._db_conn = None
+		self._db_cursor = None
+		self._db_scan_id: int | None = None
+		self._total_errors = 0
+		self._errors_by_category: dict[str, int] = {}
+		self._init_outputs()
 
+	def _init_outputs(self) -> None:
+		if "json" in self.formats:
+			path = unique_report_path(self.base.with_suffix(".json"), ".json")
+			path.parent.mkdir(parents=True, exist_ok=True)
+			self._json_handle = path.open("w", encoding="utf-8")
+			self.outputs["json"] = path
+			self._json_handle.write("{\n")
+			self._json_handle.write(f'  "source_file": {json.dumps(str(self.log_path))},\n')
+			self._json_handle.write('  "errors": [\n')
 
-def write_html_report(
-	path: Path,
-	summary: ScanSummary,
-	iter_findings: Callable[[], Iterable[Finding]],
-	report_username: str | None = None,
-	report_password: str | None = None,
-) -> Path:
-	out = unique_report_path(path, ".html")
-	out.parent.mkdir(parents=True, exist_ok=True)
+		if "csv" in self.formats:
+			path = unique_report_path(self.base.with_suffix(".csv"), ".csv")
+			path.parent.mkdir(parents=True, exist_ok=True)
+			self._csv_handle = path.open("w", encoding="utf-8", newline="")
+			self._csv_writer = csv.writer(self._csv_handle)
+			self._csv_writer.writerow(["line_number", "category", "severity", "score", "timestamp", "ip_address", "matched_phrases", "message"])
+			self.outputs["csv"] = path
 
-	requires_auth = bool(report_username and report_password)
-	user_js = json.dumps(report_username) if report_username else "null"
-	pass_js = json.dumps(report_password) if report_password else "null"
-	auth_block = ""
-	auth_script = ""
-	content_style = ""
-	if requires_auth:
-		auth_block = """
+		if "html" in self.formats:
+			path = unique_report_path(self.base.with_suffix(".html"), ".html")
+			path.parent.mkdir(parents=True, exist_ok=True)
+			self._html_handle = path.open("w", encoding="utf-8")
+			self.outputs["html"] = path
+			requires_auth = bool(self.report_username and self.report_password)
+			content_style = "style=\"display:none;\"" if requires_auth else ""
+			auth_block = ""
+			if requires_auth:
+				auth_block = """
 	<div id=\"auth\" class=\"auth\">
 		<h2>Unlock Report</h2>
 		<p>Enter your report credentials.</p>
@@ -361,29 +361,7 @@ def write_html_report(
 		<div id=\"authError\" class=\"auth-error\"></div>
 	</div>
 		"""
-		content_style = "style=\"display:none;\""
-		auth_script = f"""
-	<script>
-		const REPORT_USER = {user_js};
-		const REPORT_PASS = {pass_js};
-
-		function unlockReport() {{
-			const enteredUser = document.getElementById('username').value;
-			const enteredPass = document.getElementById('password').value;
-			if (enteredUser === REPORT_USER && enteredPass === REPORT_PASS) {{
-				document.getElementById('auth').style.display = 'none';
-				document.getElementById('content').style.display = 'block';
-				document.getElementById('authError').textContent = '';
-				return;
-			}}
-			document.getElementById('authError').textContent = 'Invalid username or password.';
-		}}
-	</script>
-		"""
-
-	total_findings = int(sum(summary.severity_breakdown.values()))
-	with out.open("w", encoding="utf-8") as handle:
-		handle.write(f"""<!doctype html>
+			self._html_handle.write(f"""<!doctype html>
 <html lang=\"en\">
 <head>
 	<meta charset=\"utf-8\" />
@@ -409,7 +387,6 @@ def write_html_report(
 	<h1>Log Error Report</h1>
 	{auth_block}
 	<div id=\"content\" {content_style}>
-		<div class=\"meta\">Source: {escape(summary.file)}<br/>Total lines: {summary.total_lines}<br/>Total findings: {total_findings}</div>
 		<table>
 			<thead>
 				<tr>
@@ -418,8 +395,145 @@ def write_html_report(
 			</thead>
 			<tbody>
 """)
-		for finding in iter_findings():
-			handle.write(
+
+		if "db" in self.formats:
+			path = unique_report_path(self.base.with_suffix(".db"), ".db")
+			path.parent.mkdir(parents=True, exist_ok=True)
+			self._db_conn = sqlite3.connect(path)
+			self._db_cursor = self._db_conn.cursor()
+			self.outputs["db"] = path
+			self._db_cursor.execute("PRAGMA journal_mode=WAL")
+			self._db_cursor.execute("PRAGMA synchronous=NORMAL")
+			self._db_cursor.execute("PRAGMA temp_store=MEMORY")
+			self._db_cursor.execute(
+				"""
+				CREATE TABLE IF NOT EXISTS scan_meta (
+					scan_id INTEGER PRIMARY KEY AUTOINCREMENT,
+					source_file TEXT NOT NULL,
+					total_lines INTEGER NOT NULL,
+					first_timestamp TEXT,
+					last_timestamp TEXT,
+					duration_seconds REAL,
+					created_at TEXT DEFAULT CURRENT_TIMESTAMP
+				)
+				"""
+			)
+			self._db_cursor.execute(
+				"""
+				CREATE TABLE IF NOT EXISTS timestamp_events (
+					event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+					scan_id INTEGER NOT NULL,
+					line_number INTEGER NOT NULL,
+					timestamp TEXT NOT NULL,
+					category TEXT NOT NULL,
+					severity TEXT NOT NULL,
+					message TEXT,
+					FOREIGN KEY(scan_id) REFERENCES scan_meta(scan_id)
+				)
+				"""
+			)
+			self._db_cursor.execute(
+				"""
+				CREATE TABLE IF NOT EXISTS time_gap_events (
+					gap_id INTEGER PRIMARY KEY AUTOINCREMENT,
+					scan_id INTEGER NOT NULL,
+					line_number INTEGER NOT NULL,
+					timestamp TEXT,
+					gap_seconds INTEGER NOT NULL,
+					severity TEXT,
+					message TEXT,
+					FOREIGN KEY(scan_id) REFERENCES scan_meta(scan_id)
+				)
+				"""
+			)
+			self._db_cursor.execute(
+				"""
+				CREATE TABLE IF NOT EXISTS ip_request_metrics (
+					metric_id INTEGER PRIMARY KEY AUTOINCREMENT,
+					scan_id INTEGER NOT NULL,
+					ip_address TEXT NOT NULL,
+					total_requests INTEGER NOT NULL,
+					malicious_request_count INTEGER NOT NULL,
+					critical_findings INTEGER NOT NULL,
+					high_findings INTEGER NOT NULL,
+					first_seen TEXT,
+					last_seen TEXT,
+					FOREIGN KEY(scan_id) REFERENCES scan_meta(scan_id)
+				)
+				"""
+			)
+			self._db_cursor.execute(
+				"""
+				CREATE TABLE IF NOT EXISTS error_phrase_metrics (
+					metric_id INTEGER PRIMARY KEY AUTOINCREMENT,
+					scan_id INTEGER NOT NULL,
+					phrase TEXT NOT NULL,
+					occurrences INTEGER NOT NULL,
+					FOREIGN KEY(scan_id) REFERENCES scan_meta(scan_id)
+				)
+				"""
+			)
+			self._db_cursor.execute(
+				"""
+				CREATE TABLE IF NOT EXISTS ip_category_metrics (
+					metric_id INTEGER PRIMARY KEY AUTOINCREMENT,
+					scan_id INTEGER NOT NULL,
+					ip_address TEXT NOT NULL,
+					category TEXT NOT NULL,
+					occurrences INTEGER NOT NULL,
+					FOREIGN KEY(scan_id) REFERENCES scan_meta(scan_id)
+				)
+				"""
+			)
+			self._db_cursor.execute(
+				"""
+				CREATE TABLE IF NOT EXISTS uptime_intervals (
+					interval_id INTEGER PRIMARY KEY AUTOINCREMENT,
+					scan_id INTEGER NOT NULL,
+					interval_index INTEGER NOT NULL,
+					interval_start TEXT,
+					interval_end TEXT,
+					total_events INTEGER NOT NULL,
+					malicious_events INTEGER NOT NULL,
+					downtime_seconds INTEGER NOT NULL,
+					uptime_percent REAL NOT NULL,
+					FOREIGN KEY(scan_id) REFERENCES scan_meta(scan_id)
+				)
+				"""
+			)
+			self._db_cursor.execute("CREATE INDEX IF NOT EXISTS idx_ip_malicious_requests ON ip_request_metrics (scan_id, malicious_request_count DESC)")
+			self._db_cursor.execute(
+				"INSERT INTO scan_meta (source_file, total_lines, first_timestamp, last_timestamp, duration_seconds) VALUES (?, ?, ?, ?, ?)",
+				(str(self.log_path), 0, None, None, None),
+			)
+			self._db_scan_id = int(self._db_cursor.lastrowid)
+			self._db_conn.commit()
+
+	def consume(self, finding: Finding) -> None:
+		self.accumulator.consume(finding)
+		self._total_errors += 1
+		self._errors_by_category[finding.category] = self._errors_by_category.get(finding.category, 0) + 1
+
+		if self._json_handle is not None:
+			if not self._json_first:
+				self._json_handle.write(",\n")
+			self._json_handle.write(f"    {json.dumps(_finding_to_dict(finding))}")
+			self._json_first = False
+
+		if self._csv_writer is not None:
+			self._csv_writer.writerow([
+				finding.line_number,
+				finding.category,
+				finding.severity,
+				finding.score,
+				finding.timestamp or "",
+				finding.ip_address or "",
+				";".join(finding.matched_phrases),
+				finding.message,
+			])
+
+		if self._html_handle is not None:
+			self._html_handle.write(
 				"<tr>"
 				f"<td>{finding.line_number}</td>"
 				f"<td>{escape(finding.category)}</td>"
@@ -431,221 +545,138 @@ def write_html_report(
 				f"<td>{escape(finding.message)}</td>"
 				"</tr>\n"
 			)
-		handle.write(f"""			</tbody>
+
+		if self._db_cursor is not None and self._db_scan_id is not None:
+			if finding.timestamp is not None:
+				self._db_cursor.execute(
+					"INSERT INTO timestamp_events (scan_id, line_number, timestamp, category, severity, message) VALUES (?, ?, ?, ?, ?, ?)",
+					(self._db_scan_id, finding.line_number, finding.timestamp, finding.category, finding.severity, finding.message),
+				)
+			if finding.timestamp is not None and finding.category == "time_gap":
+				self._db_cursor.execute(
+					"INSERT INTO time_gap_events (scan_id, line_number, timestamp, gap_seconds, severity, message) VALUES (?, ?, ?, ?, ?, ?)",
+					(self._db_scan_id, finding.line_number, finding.timestamp, _extract_gap_seconds(finding), finding.severity, finding.message),
+				)
+
+	def finalize(self, summary: ScanSummary) -> dict[str, Path]:
+		script_runtime = None
+		if self.script_start_time is not None:
+			script_runtime = max(0.0, time.perf_counter() - self.script_start_time)
+		dashboard_metrics = self.accumulator.finalize(summary, script_runtime_seconds=script_runtime)
+
+		if self._json_handle is not None:
+			self._json_handle.write("\n  ],\n")
+			self._json_handle.write(f'  "total_lines": {summary.total_lines},\n')
+			self._json_handle.write(f'  "total_errors": {self._total_errors},\n')
+			self._json_handle.write(f'  "errors_by_category": {json.dumps(self._errors_by_category)},\n')
+			self._json_handle.write(f'  "errors_by_severity": {json.dumps(summary.severity_breakdown)},\n')
+			self._json_handle.write(f'  "summary": {json.dumps(_summary_payload(summary))}\n')
+			self._json_handle.write("}\n")
+			self._json_handle.close()
+
+		if self._csv_handle is not None:
+			self._csv_handle.close()
+
+		if self._html_handle is not None:
+			auth_script = ""
+			if self.report_username and self.report_password:
+				user_js = json.dumps(self.report_username)
+				pass_js = json.dumps(self.report_password)
+				auth_script = f"""
+	<script>
+		const REPORT_USER = {user_js};
+		const REPORT_PASS = {pass_js};
+
+		function unlockReport() {{
+			const enteredUser = document.getElementById('username').value;
+			const enteredPass = document.getElementById('password').value;
+			if (enteredUser === REPORT_USER && enteredPass === REPORT_PASS) {{
+				document.getElementById('auth').style.display = 'none';
+				document.getElementById('content').style.display = 'block';
+				document.getElementById('authError').textContent = '';
+				return;
+			}}
+			document.getElementById('authError').textContent = 'Invalid username or password.';
+		}}
+	</script>
+		"""
+			self._html_handle.write(f"""\
+			</tbody>
 		</table>
+		<div class=\"meta\">Source: {escape(summary.file)}<br/>Total lines: {summary.total_lines}<br/>Total findings: {self._total_errors}</div>
 	</div>
 	{auth_script}
 </body>
 </html>
 """)
-	return out
+			self._html_handle.close()
 
-
-def write_timestamps_db(
-	path: Path,
-	summary: ScanSummary,
-	iter_findings: Callable[[], Iterable[Finding]],
-	dashboard_metrics: dict[str, Any],
-) -> Path:
-	out = unique_report_path(path, ".db")
-	out.parent.mkdir(parents=True, exist_ok=True)
-	conn = sqlite3.connect(out)
-	try:
-		conn.execute("PRAGMA journal_mode=WAL")
-		conn.execute("PRAGMA synchronous=NORMAL")
-		conn.execute("PRAGMA temp_store=MEMORY")
-		cur = conn.cursor()
-		cur.execute(
-			"""
-			CREATE TABLE IF NOT EXISTS scan_meta (
-				scan_id INTEGER PRIMARY KEY AUTOINCREMENT,
-				source_file TEXT NOT NULL,
-				total_lines INTEGER NOT NULL,
-				first_timestamp TEXT,
-				last_timestamp TEXT,
-				duration_seconds REAL,
-				created_at TEXT DEFAULT CURRENT_TIMESTAMP
+		if self._db_conn is not None and self._db_cursor is not None and self._db_scan_id is not None:
+			first_ts = dashboard_metrics.get("trend_metadata", {}).get("first_timestamp")
+			last_ts = dashboard_metrics.get("trend_metadata", {}).get("last_timestamp")
+			duration = None
+			if self.accumulator.first_ts is not None and self.accumulator.last_ts is not None and self.accumulator.last_ts > self.accumulator.first_ts:
+				duration = (self.accumulator.last_ts - self.accumulator.first_ts).total_seconds()
+			self._db_cursor.execute(
+				"UPDATE scan_meta SET source_file = ?, total_lines = ?, first_timestamp = ?, last_timestamp = ?, duration_seconds = ? WHERE scan_id = ?",
+				(summary.file, summary.total_lines, first_ts, last_ts, duration, self._db_scan_id),
 			)
-			"""
-		)
-		cur.execute(
-			"""
-			CREATE TABLE IF NOT EXISTS timestamp_events (
-				event_id INTEGER PRIMARY KEY AUTOINCREMENT,
-				scan_id INTEGER NOT NULL,
-				line_number INTEGER NOT NULL,
-				timestamp TEXT NOT NULL,
-				category TEXT NOT NULL,
-				severity TEXT NOT NULL,
-				message TEXT,
-				FOREIGN KEY(scan_id) REFERENCES scan_meta(scan_id)
-			)
-			"""
-		)
-		cur.execute(
-			"""
-			CREATE TABLE IF NOT EXISTS time_gap_events (
-				gap_id INTEGER PRIMARY KEY AUTOINCREMENT,
-				scan_id INTEGER NOT NULL,
-				line_number INTEGER NOT NULL,
-				timestamp TEXT,
-				gap_seconds INTEGER NOT NULL,
-				severity TEXT,
-				message TEXT,
-				FOREIGN KEY(scan_id) REFERENCES scan_meta(scan_id)
-			)
-			"""
-		)
-		cur.execute(
-			"""
-			CREATE TABLE IF NOT EXISTS ip_request_metrics (
-				metric_id INTEGER PRIMARY KEY AUTOINCREMENT,
-				scan_id INTEGER NOT NULL,
-				ip_address TEXT NOT NULL,
-				total_requests INTEGER NOT NULL,
-				malicious_request_count INTEGER NOT NULL,
-				critical_findings INTEGER NOT NULL,
-				high_findings INTEGER NOT NULL,
-				first_seen TEXT,
-				last_seen TEXT,
-				FOREIGN KEY(scan_id) REFERENCES scan_meta(scan_id)
-			)
-			"""
-		)
-		cur.execute(
-			"""
-			CREATE TABLE IF NOT EXISTS error_phrase_metrics (
-				metric_id INTEGER PRIMARY KEY AUTOINCREMENT,
-				scan_id INTEGER NOT NULL,
-				phrase TEXT NOT NULL,
-				occurrences INTEGER NOT NULL,
-				FOREIGN KEY(scan_id) REFERENCES scan_meta(scan_id)
-			)
-			"""
-		)
-		cur.execute(
-			"""
-			CREATE TABLE IF NOT EXISTS ip_category_metrics (
-				metric_id INTEGER PRIMARY KEY AUTOINCREMENT,
-				scan_id INTEGER NOT NULL,
-				ip_address TEXT NOT NULL,
-				category TEXT NOT NULL,
-				occurrences INTEGER NOT NULL,
-				FOREIGN KEY(scan_id) REFERENCES scan_meta(scan_id)
-			)
-			"""
-		)
-		cur.execute(
-			"""
-			CREATE TABLE IF NOT EXISTS uptime_intervals (
-				interval_id INTEGER PRIMARY KEY AUTOINCREMENT,
-				scan_id INTEGER NOT NULL,
-				interval_index INTEGER NOT NULL,
-				interval_start TEXT,
-				interval_end TEXT,
-				total_events INTEGER NOT NULL,
-				malicious_events INTEGER NOT NULL,
-				downtime_seconds INTEGER NOT NULL,
-				uptime_percent REAL NOT NULL,
-				FOREIGN KEY(scan_id) REFERENCES scan_meta(scan_id)
-			)
-			"""
-		)
-		cur.execute("CREATE INDEX IF NOT EXISTS idx_ip_malicious_requests ON ip_request_metrics (scan_id, malicious_request_count DESC)")
-
-		first_ts: datetime | None = None
-		last_ts: datetime | None = None
-		for finding in iter_findings():
-			parsed = parse_timestamp_text(finding.timestamp)
-			if parsed is None:
-				continue
-			if first_ts is None or parsed < first_ts:
-				first_ts = parsed
-			if last_ts is None or parsed > last_ts:
-				last_ts = parsed
-		duration = (last_ts - first_ts).total_seconds() if first_ts and last_ts and last_ts > first_ts else None
-
-		cur.execute(
-			"INSERT INTO scan_meta (source_file, total_lines, first_timestamp, last_timestamp, duration_seconds) VALUES (?, ?, ?, ?, ?)",
-			(summary.file, summary.total_lines, first_ts.isoformat() if first_ts else None, last_ts.isoformat() if last_ts else None, duration),
-		)
-		scan_id = int(cur.lastrowid)
-
-		for finding in iter_findings():
-			if finding.timestamp is not None:
-				cur.execute(
-					"INSERT INTO timestamp_events (scan_id, line_number, timestamp, category, severity, message) VALUES (?, ?, ?, ?, ?, ?)",
-					(scan_id, finding.line_number, finding.timestamp, finding.category, finding.severity, finding.message),
+			for row in dashboard_metrics.get("ip_request_metrics", []):
+				self._db_cursor.execute(
+					"""
+					INSERT INTO ip_request_metrics
+					(scan_id, ip_address, total_requests, malicious_request_count, critical_findings, high_findings, first_seen, last_seen)
+					VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+					""",
+					(
+						self._db_scan_id,
+						row.get("ip_address"),
+						row.get("total_requests", 0),
+						row.get("malicious_request_count", 0),
+						row.get("critical_findings", 0),
+						row.get("high_findings", 0),
+						row.get("first_seen"),
+						row.get("last_seen"),
+					),
 				)
-			if finding.timestamp is not None and finding.category == "time_gap":
-				cur.execute(
-					"INSERT INTO time_gap_events (scan_id, line_number, timestamp, gap_seconds, severity, message) VALUES (?, ?, ?, ?, ?, ?)",
-					(scan_id, finding.line_number, finding.timestamp, _extract_gap_seconds(finding), finding.severity, finding.message),
+			for row in dashboard_metrics.get("error_phrase_frequency", []):
+				self._db_cursor.execute(
+					"INSERT INTO error_phrase_metrics (scan_id, phrase, occurrences) VALUES (?, ?, ?)",
+					(self._db_scan_id, row.get("phrase"), row.get("occurrences", 0)),
 				)
+			for row in dashboard_metrics.get("ip_error_correlation", []):
+				self._db_cursor.execute(
+					"INSERT INTO ip_category_metrics (scan_id, ip_address, category, occurrences) VALUES (?, ?, ?, ?)",
+					(self._db_scan_id, row.get("ip_address"), row.get("category"), row.get("occurrences", 0)),
+				)
+			for row in dashboard_metrics.get("time_series", []):
+				self._db_cursor.execute(
+					"""
+					INSERT INTO uptime_intervals
+					(scan_id, interval_index, interval_start, interval_end, total_events, malicious_events, downtime_seconds, uptime_percent)
+					VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+					""",
+					(
+						self._db_scan_id,
+						row.get("index", 0),
+						row.get("interval_start"),
+						row.get("interval_end"),
+						row.get("total_events", 0),
+						row.get("malicious_events", 0),
+						row.get("downtime_seconds", 0),
+						row.get("uptime_percent", 100.0),
+					),
+				)
+			self._db_conn.commit()
+			self._db_conn.close()
 
-		for row in dashboard_metrics.get("ip_request_metrics", []):
-			cur.execute(
-				"""
-				INSERT INTO ip_request_metrics
-				(scan_id, ip_address, total_requests, malicious_request_count, critical_findings, high_findings, first_seen, last_seen)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-				""",
-				(
-					scan_id,
-					row.get("ip_address"),
-					row.get("total_requests", 0),
-					row.get("malicious_request_count", 0),
-					row.get("critical_findings", 0),
-					row.get("high_findings", 0),
-					row.get("first_seen"),
-					row.get("last_seen"),
-				),
-			)
+		if self.include_dashboard_metrics:
+			metrics_path = unique_report_path(self.base.parent / f"{self.base.name}_dashboard_metrics.json", ".json")
+			metrics_path.parent.mkdir(parents=True, exist_ok=True)
+			metrics_path.write_text(json.dumps(dashboard_metrics, indent=2), encoding="utf-8")
+			self.outputs["dashboard_metrics"] = metrics_path
 
-		for row in dashboard_metrics.get("error_phrase_frequency", []):
-			cur.execute(
-				"INSERT INTO error_phrase_metrics (scan_id, phrase, occurrences) VALUES (?, ?, ?)",
-				(scan_id, row.get("phrase"), row.get("occurrences", 0)),
-			)
-
-		for row in dashboard_metrics.get("ip_error_correlation", []):
-			cur.execute(
-				"INSERT INTO ip_category_metrics (scan_id, ip_address, category, occurrences) VALUES (?, ?, ?, ?)",
-				(scan_id, row.get("ip_address"), row.get("category"), row.get("occurrences", 0)),
-			)
-
-		for row in dashboard_metrics.get("time_series", []):
-			cur.execute(
-				"""
-				INSERT INTO uptime_intervals
-				(scan_id, interval_index, interval_start, interval_end, total_events, malicious_events, downtime_seconds, uptime_percent)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-				""",
-				(
-					scan_id,
-					row.get("index", 0),
-					row.get("interval_start"),
-					row.get("interval_end"),
-					row.get("total_events", 0),
-					row.get("malicious_events", 0),
-					row.get("downtime_seconds", 0),
-					row.get("uptime_percent", 100.0),
-				),
-			)
-		conn.commit()
-	finally:
-		conn.close()
-
-	return out
-
-
-def normalize_requested_formats(requested_formats: list[str] | None) -> list[str]:
-	if not requested_formats:
-		return list(SUPPORTED_FORMATS)
-
-	normalized = [fmt.strip().lower() for fmt in requested_formats if fmt.strip()]
-	valid = [fmt for fmt in normalized if fmt in SUPPORTED_FORMATS]
-	return valid if valid else list(SUPPORTED_FORMATS)
+		return self.outputs
 
 
 def write_all_reports(
@@ -664,40 +695,22 @@ def write_all_reports(
 	if findings_jsonl is None and findings is None:
 		raise ValueError("Either findings or findings_jsonl must be provided")
 
-	def iter_findings() -> Iterable[Finding]:
-		if findings_jsonl is not None:
-			return _iter_findings_from_jsonl(findings_jsonl)
-		return iter(findings or [])
+	writer = StreamingReportWriter(
+		log_path,
+		requested_formats=requested_formats,
+		output_dir=output_dir,
+		explicit_path=explicit_path,
+		report_username=report_username,
+		report_password=report_password,
+		include_dashboard_metrics=include_dashboard_metrics,
+		script_start_time=script_start_time,
+	)
 
-	base = resolve_report_base(log_path, output_dir=output_dir, explicit_path=explicit_path)
-	formats = normalize_requested_formats(requested_formats)
+	if findings is not None:
+		for finding in findings:
+			writer.consume(finding)
+	else:
+		for finding in _iter_findings_from_jsonl(findings_jsonl):
+			writer.consume(finding)
 
-	outputs: dict[str, Path] = {}
-	dashboard_metrics: dict[str, Any] | None = None
-	script_runtime_seconds = None
-	if script_start_time is not None:
-		script_runtime_seconds = max(0.0, time.perf_counter() - script_start_time)
-	if include_dashboard_metrics or "db" in formats:
-		dashboard_metrics = build_dashboard_metrics(summary, iter_findings, script_runtime_seconds=script_runtime_seconds)
-	if include_dashboard_metrics and dashboard_metrics is not None:
-		outputs["dashboard_metrics"] = write_dashboard_metrics_json(
-			base.parent / f"{base.name}_dashboard_metrics.json",
-			dashboard_metrics,
-		)
-	if "json" in formats:
-		outputs["json"] = write_json_report(base.with_suffix(".json"), summary, iter_findings)
-	if "csv" in formats:
-		outputs["csv"] = write_csv_report(base.with_suffix(".csv"), iter_findings)
-	if "html" in formats:
-		outputs["html"] = write_html_report(
-			base.with_suffix(".html"),
-			summary,
-			iter_findings,
-			report_username=report_username,
-			report_password=report_password,
-		)
-	if "db" in formats:
-		if dashboard_metrics is None:
-			dashboard_metrics = build_dashboard_metrics(summary, iter_findings, script_runtime_seconds=script_runtime_seconds)
-		outputs["db"] = write_timestamps_db(base.with_suffix(".db"), summary, iter_findings, dashboard_metrics)
-	return outputs
+	return writer.finalize(summary)

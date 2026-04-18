@@ -3,14 +3,11 @@
 from __future__ import annotations
 
 import argparse
-import csv
-import gzip
 import json
-import tempfile
 import time
 from pathlib import Path
 
-from reporting import default_error_report_dir, normalize_requested_formats, resolve_report_base, unique_report_path, write_all_reports
+from reporting import StreamingReportWriter, normalize_requested_formats
 from scanner_core import scan_log_file
 from tui_dashboard import launch_dashboard
 
@@ -118,86 +115,24 @@ def main() -> int:
 		requested_formats = [fmt for fmt in requested_formats if fmt != "db"]
 		print("Info: DB output requires web mode. Skipping DB because --web was not provided.")
 
-	base = resolve_report_base(args.log_path, output_dir=args.output_dir, explicit_path=args.error_report)
-	outputs: dict[str, Path] = {}
+	writer = StreamingReportWriter(
+		args.log_path,
+		requested_formats=requested_formats,
+		output_dir=args.output_dir,
+		explicit_path=args.error_report,
+		report_username=args.report_username,
+		report_password=args.report_password,
+		include_dashboard_metrics=args.tui,
+		script_start_time=script_start_time,
+	)
 
-	if requested_formats == ["csv"] and not args.tui:
-		csv_path = unique_report_path(base.with_suffix(".csv"), ".csv")
-		csv_path.parent.mkdir(parents=True, exist_ok=True)
-		with csv_path.open("w", encoding="utf-8", newline="") as handle:
-			writer = csv.writer(handle)
-			writer.writerow(["line_number", "category", "severity", "score", "timestamp", "ip_address", "matched_phrases", "message"])
-
-			def csv_sink(finding) -> None:
-				writer.writerow([
-					finding.line_number,
-					finding.category,
-					finding.severity,
-					finding.score,
-					finding.timestamp or "",
-					finding.ip_address or "",
-					";".join(finding.matched_phrases),
-					finding.message,
-				])
-
-		_, summary = scan_log_file(
-			args.log_path,
-			collect_findings=False,
-			finding_sink=csv_sink,
-			workers=args.workers,
-		)
-		outputs["csv"] = csv_path
-	else:
-		spool_dir = (args.output_dir if args.output_dir is not None else default_error_report_dir(args.log_path)).resolve()
-		spool_dir.mkdir(parents=True, exist_ok=True)
-		temp_spool = tempfile.NamedTemporaryFile(mode="wb", suffix=".jsonl.gz", dir=spool_dir, delete=False)
-		spool_path = Path(temp_spool.name)
-		spool_handle = None
-		try:
-			spool_handle = gzip.open(temp_spool, mode="wt", encoding="utf-8", compresslevel=1)
-
-			def sink_finding(finding) -> None:
-				try:
-					spool_handle.write(json.dumps(finding.__dict__, separators=(",", ":")) + "\n")
-				except OSError as exc:
-					raise RuntimeError(
-						"Scan spool storage quota was exceeded. Use --formats csv for direct streaming output or choose a larger --output-dir."
-					) from exc
-
-			_, summary = scan_log_file(
-				args.log_path,
-				collect_findings=False,
-				finding_sink=sink_finding,
-				workers=args.workers,
-			)
-			spool_handle.close()
-			temp_spool.close()
-			outputs = write_all_reports(
-				args.log_path,
-				summary,
-				findings_jsonl=spool_path,
-				script_start_time=script_start_time,
-				include_dashboard_metrics=args.tui,
-				output_dir=args.output_dir,
-				explicit_path=args.error_report,
-				requested_formats=requested_formats,
-				report_username=args.report_username,
-				report_password=args.report_password,
-			)
-		finally:
-			if spool_handle is not None:
-				try:
-					spool_handle.close()
-				except OSError:
-					pass
-			try:
-				temp_spool.close()
-			except OSError:
-				pass
-			try:
-				spool_path.unlink()
-			except OSError:
-				pass
+	_, summary = scan_log_file(
+		args.log_path,
+		collect_findings=False,
+		finding_sink=writer.consume,
+		workers=args.workers,
+	)
+	outputs = writer.finalize(summary)
 	auth_path = write_frontend_auth(outputs, args.report_username, args.report_password) if args.web else None
 	show_text_summary = True
 	if args.tui and "dashboard_metrics" in outputs:
