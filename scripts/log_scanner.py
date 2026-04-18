@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import gzip
 import json
-import shutil
+import tempfile
+import time
 from pathlib import Path
 
-from reporting import write_all_reports
+from reporting import default_error_report_dir, normalize_requested_formats, resolve_report_base, unique_report_path, write_all_reports
 from scanner_core import scan_log_file
 from tui_dashboard import launch_dashboard
 
@@ -31,7 +34,7 @@ def parse_args() -> argparse.Namespace:
 		"--formats",
 		type=str,
 		default=None,
-		help="Comma-separated formats: json,csv,html,yaml,db (default: all)",
+		help="Comma-separated formats: json,csv,html,db (default: all)",
 	)
 	parser.add_argument(
 		"--report-username",
@@ -49,6 +52,17 @@ def parse_args() -> argparse.Namespace:
 		"--tui",
 		action="store_true",
 		help="Open the terminal dashboard after the scan completes",
+	)
+	parser.add_argument(
+		"--web",
+		action="store_true",
+		help="Enable web-facing artifacts (DB and auth output)",
+	)
+	parser.add_argument(
+		"--workers",
+		type=int,
+		default=None,
+		help="Worker threads for scanning (default: CPU core count)",
 	)
 	return parser.parse_args()
 
@@ -81,7 +95,7 @@ def write_frontend_auth(outputs: dict[str, Path], report_username: str | None, r
 	if not report_username or not report_password:
 		return None
 	repo_root = Path(__file__).resolve().parents[1]
-	auth_dir = repo_root / "auth"
+	auth_dir = repo_root / "private_auth"
 	auth_dir.mkdir(parents=True, exist_ok=True)
 	auth_path = auth_dir / "frontend_auth.json"
 	auth_path.write_text(
@@ -91,48 +105,102 @@ def write_frontend_auth(outputs: dict[str, Path], report_username: str | None, r
 	return auth_path
 
 
-def clear_error_directory() -> tuple[int, int]:
-	repo_root = Path(__file__).resolve().parents[1]
-	error_dir = repo_root / "error"
-	if not error_dir.exists() or not error_dir.is_dir():
-		return 0, 0
-
-	deleted_files = 0
-	deleted_dirs = 0
-	for entry in error_dir.iterdir():
-		try:
-			if entry.is_dir():
-				shutil.rmtree(entry)
-				deleted_dirs += 1
-			else:
-				entry.unlink()
-				deleted_files += 1
-		except OSError:
-			continue
-	return deleted_files, deleted_dirs
-
-
 def main() -> int:
 	args = parse_args()
+	script_start_time = time.perf_counter()
 
 	if not args.log_path.exists() or not args.log_path.is_file():
 		print(f"Error: file not found: {args.log_path}")
 		return 1
 
-	findings, summary = scan_log_file(args.log_path)
-	outputs = write_all_reports(
-		args.log_path,
-		summary,
-		findings,
-		output_dir=args.output_dir,
-		explicit_path=args.error_report,
-		requested_formats=args.formats.split(",") if args.formats else None,
-		report_username=args.report_username,
-		report_password=args.report_password,
-	)
-	auth_path = write_frontend_auth(outputs, args.report_username, args.report_password)
+	requested_formats = normalize_requested_formats(args.formats.split(",") if args.formats else None)
+	if not args.web and "db" in requested_formats:
+		requested_formats = [fmt for fmt in requested_formats if fmt != "db"]
+		print("Info: DB output requires web mode. Skipping DB because --web was not provided.")
+
+	base = resolve_report_base(args.log_path, output_dir=args.output_dir, explicit_path=args.error_report)
+	outputs: dict[str, Path] = {}
+
+	if requested_formats == ["csv"] and not args.tui:
+		csv_path = unique_report_path(base.with_suffix(".csv"), ".csv")
+		csv_path.parent.mkdir(parents=True, exist_ok=True)
+		with csv_path.open("w", encoding="utf-8", newline="") as handle:
+			writer = csv.writer(handle)
+			writer.writerow(["line_number", "category", "severity", "score", "timestamp", "ip_address", "matched_phrases", "message"])
+
+			def csv_sink(finding) -> None:
+				writer.writerow([
+					finding.line_number,
+					finding.category,
+					finding.severity,
+					finding.score,
+					finding.timestamp or "",
+					finding.ip_address or "",
+					";".join(finding.matched_phrases),
+					finding.message,
+				])
+
+		_, summary = scan_log_file(
+			args.log_path,
+			collect_findings=False,
+			finding_sink=csv_sink,
+			workers=args.workers,
+		)
+		outputs["csv"] = csv_path
+	else:
+		spool_dir = (args.output_dir if args.output_dir is not None else default_error_report_dir(args.log_path)).resolve()
+		spool_dir.mkdir(parents=True, exist_ok=True)
+		temp_spool = tempfile.NamedTemporaryFile(mode="wb", suffix=".jsonl.gz", dir=spool_dir, delete=False)
+		spool_path = Path(temp_spool.name)
+		spool_handle = None
+		try:
+			spool_handle = gzip.open(temp_spool, mode="wt", encoding="utf-8", compresslevel=1)
+
+			def sink_finding(finding) -> None:
+				try:
+					spool_handle.write(json.dumps(finding.__dict__, separators=(",", ":")) + "\n")
+				except OSError as exc:
+					raise RuntimeError(
+						"Scan spool storage quota was exceeded. Use --formats csv for direct streaming output or choose a larger --output-dir."
+					) from exc
+
+			_, summary = scan_log_file(
+				args.log_path,
+				collect_findings=False,
+				finding_sink=sink_finding,
+				workers=args.workers,
+			)
+			spool_handle.close()
+			temp_spool.close()
+			outputs = write_all_reports(
+				args.log_path,
+				summary,
+				findings_jsonl=spool_path,
+				script_start_time=script_start_time,
+				include_dashboard_metrics=args.tui,
+				output_dir=args.output_dir,
+				explicit_path=args.error_report,
+				requested_formats=requested_formats,
+				report_username=args.report_username,
+				report_password=args.report_password,
+			)
+		finally:
+			if spool_handle is not None:
+				try:
+					spool_handle.close()
+				except OSError:
+					pass
+			try:
+				temp_spool.close()
+			except OSError:
+				pass
+			try:
+				spool_path.unlink()
+			except OSError:
+				pass
+	auth_path = write_frontend_auth(outputs, args.report_username, args.report_password) if args.web else None
 	show_text_summary = True
-	if "dashboard_metrics" in outputs:
+	if args.tui and "dashboard_metrics" in outputs:
 		try:
 			website_message = 'Report has been generated at the website. Please visit the webpage.'
 			if args.report_username:
@@ -148,13 +216,11 @@ def main() -> int:
 	if show_text_summary:
 		print_report(summary, args.report_username)
 	print("\nGenerated report artifacts:")
-	for kind in ("json", "csv", "html", "yaml", "db", "dashboard_metrics"):
+	for kind in ("json", "csv", "html", "db", "dashboard_metrics"):
 		if kind in outputs:
 			print(f"  - {kind.upper()}: {outputs[kind]}")
 	if auth_path is not None:
 		print(f"  - FRONTEND_AUTH: {auth_path}")
-	deleted_files, deleted_dirs = clear_error_directory()
-	print(f"\nError directory cleanup complete: removed {deleted_files} files and {deleted_dirs} folders from \"error/\".")
 	return 0
 
 

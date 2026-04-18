@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 import os
 import re
-from dataclasses import dataclass
-from datetime import datetime, timedelta
 from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass
+from itertools import islice
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 MALICIOUS_PATTERNS: list[tuple[str, re.Pattern[str], str, int]] = [
 	(
@@ -57,6 +58,12 @@ TIMESTAMP_FORMATS: list[str] = [
 CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
 KEY_VALUE_RE = re.compile(r"(?:^|\s)([A-Za-z0-9_.:-]+)=")
 ERROR_KEYPHRASES = [
+	"authentication failure",
+	"access denied",
+	"permission denied",
+	"connection refused",
+	"service unavailable",
+	"timed out",
 	"error",
 	"failed",
 	"failure",
@@ -105,6 +112,28 @@ ENABLE_OUT_OF_ORDER_TIMESTAMP = False
 TIME_GAP_THRESHOLD_HIGH = timedelta(seconds=300)
 TIME_GAP_THRESHOLD_CRITICAL = timedelta(seconds=500)
 COMMON_KEY_MIN_LINES = 5
+LINE_BATCH_SIZE = 4096
+
+HIGH_SEVERITY_ERROR_TERMS = {
+	"error",
+	"failed",
+	"failure",
+	"fatal",
+	"critical",
+	"panic",
+	"denied",
+	"unauthorized",
+	"forbidden",
+	"authentication failure",
+	"access denied",
+	"permission denied",
+	"connection refused",
+}
+
+ERROR_PHRASE_PATTERNS: list[tuple[str, re.Pattern[str]]] = []
+for _phrase in ERROR_KEYPHRASES:
+	_phrase_re = re.escape(_phrase).replace(r"\ ", r"\s+")
+	ERROR_PHRASE_PATTERNS.append((_phrase, re.compile(rf"\b{_phrase_re}\b")))
 
 
 @dataclass
@@ -128,6 +157,12 @@ class LineScanResult:
 	ip_address: str | None
 	line_keys: list[str]
 	findings: list[Finding]
+
+
+@dataclass
+class ScanBatch:
+	rows: list[tuple[int, str]]
+	bytes_read: int
 
 
 @dataclass
@@ -167,14 +202,6 @@ def parse_timestamp_text(raw: str | None) -> datetime | None:
 		except ValueError:
 			continue
 	return None
-
-
-def parse_timestamp(line: str) -> datetime | None:
-	return parse_timestamp_text(extract_timestamp_text(line))
-
-
-def open_log_handle(log_path: Path):
-	return log_path.open("r", encoding="utf-8", errors="replace")
 
 
 def extract_timestamp_text(line: str) -> str | None:
@@ -245,21 +272,36 @@ def _detect_malicious_context(line_number: int, timestamp_text: str | None, ip_a
 	return findings
 
 
-def _detect_error_keywords_context(line_number: int, timestamp_text: str | None, ip_addr: str | None, line_snippet: str, line: str) -> list[Finding]:
+def _extract_error_matches(line: str) -> list[str]:
 	text_lower = line.lower()
 	matches: list[str] = []
-	for phrase in ERROR_KEYPHRASES:
-		if phrase in text_lower:
+	covered_ranges: list[tuple[int, int]] = []
+
+	for phrase, pattern in ERROR_PHRASE_PATTERNS:
+		for match in pattern.finditer(text_lower):
 			matches.append(phrase)
-	for word in extract_words(line):
-		if word in ERROR_KEYWORDS:
+			covered_ranges.append(match.span())
+
+	def word_is_covered(word: str) -> bool:
+		for word_match in re.finditer(rf"\b{re.escape(word)}\b", text_lower):
+			for start, end in covered_ranges:
+				if word_match.start() >= start and word_match.end() <= end:
+					return True
+		return False
+
+	for word in extract_words(text_lower):
+		if word in ERROR_KEYWORDS and not word_is_covered(word):
 			matches.append(word)
 
+	return sorted(set(matches))[:6]
+
+
+def _detect_error_keywords_context(line_number: int, timestamp_text: str | None, ip_addr: str | None, line_snippet: str, line: str) -> list[Finding]:
+	matches = _extract_error_matches(line)
 	if not matches:
 		return []
 
-	severity = "high" if any(word in {"error", "failed", "failure", "fatal", "critical", "panic", "denied", "refused", "unauthorized", "forbidden"} for word in matches) else "medium"
-	matched = sorted(set(matches))[:6]
+	severity = "high" if any(word in HIGH_SEVERITY_ERROR_TERMS for word in matches) else "medium"
 	return [
 		Finding(
 			line_number=line_number,
@@ -267,7 +309,7 @@ def _detect_error_keywords_context(line_number: int, timestamp_text: str | None,
 			severity=severity,
 			score=6 if severity == "high" else 4,
 			timestamp=timestamp_text,
-			matched_phrases=matched,
+			matched_phrases=matches,
 			message=line_snippet,
 			ip_address=ip_addr,
 		)
@@ -374,142 +416,6 @@ def _scan_line_batch(batch: list[tuple[int, str]]) -> list[LineScanResult]:
 	return results
 
 
-def detect_malicious(line: str, line_number: int) -> Iterable[Finding]:
-	findings: list[Finding] = []
-	timestamp_text = extract_timestamp_text(line)
-	clean_message = line.strip()[:240]
-	ip_addr = extract_all_ips(line)
-	for _, pattern, reason, score in MALICIOUS_PATTERNS:
-		if pattern.search(line):
-			findings.append(
-				Finding(
-					line_number=line_number,
-					category="malicious",
-					severity=score_to_severity(score),
-					score=score,
-					timestamp=timestamp_text,
-					matched_phrases=[reason],
-					message=clean_message,
-					ip_address=ip_addr,
-				)
-			)
-	return findings
-
-
-def detect_error_keywords(line: str, line_number: int) -> Iterable[Finding]:
-	text = line.strip()
-	if not text:
-		return []
-
-	text_lower = text.lower()
-	matches: list[str] = []
-	for phrase in ERROR_KEYPHRASES:
-		if phrase in text_lower:
-			matches.append(phrase)
-	for word in extract_words(text):
-		if word in ERROR_KEYWORDS:
-			matches.append(word)
-
-	if not matches:
-		return []
-
-	severity = "high" if any(word in {"error", "failed", "failure", "fatal", "critical", "panic", "denied", "refused", "unauthorized", "forbidden"} for word in matches) else "medium"
-	matched = sorted(set(matches))[:6]
-	ip_addr = extract_all_ips(line)
-	return [
-		Finding(
-			line_number=line_number,
-			category="error_log",
-			severity=severity,
-			score=6 if severity == "high" else 4,
-			timestamp=extract_timestamp_text(line),
-			matched_phrases=matched,
-			message=text[:240],
-			ip_address=ip_addr,
-		)
-	]
-
-
-def detect_missing_keys(line: str, line_number: int, expected_keys: list[str]) -> Iterable[Finding]:
-	if not expected_keys:
-		return []
-
-	line_keys = extract_keys(line)
-	if not line_keys:
-		return []
-
-	missing = [key for key in expected_keys if key not in line_keys]
-	if not missing:
-		return []
-
-	ip_addr = extract_all_ips(line)
-	return [
-		Finding(
-			line_number=line_number,
-			category="schema",
-			severity="medium",
-			score=3,
-			timestamp=extract_timestamp_text(line),
-			matched_phrases=missing[:8],
-			message=line.strip()[:240],
-			ip_address=ip_addr,
-		)
-	]
-
-
-def detect_corruption(line: str, line_number: int) -> Iterable[Finding]:
-	findings: list[Finding] = []
-	stripped = line.rstrip("\n")
-	timestamp_text = extract_timestamp_text(line)
-	ip_addr = extract_all_ips(line)
-
-	replacement_count = stripped.count("\ufffd")
-	if replacement_count >= 2:
-		score = min(8, 2 + replacement_count)
-		findings.append(
-			Finding(
-				line_number=line_number,
-				category="corruption",
-				severity=score_to_severity(score),
-				score=score,
-				timestamp=timestamp_text,
-				matched_phrases=[f"decode_replacement:{replacement_count}"],
-				message=stripped[:240],
-				ip_address=ip_addr,
-			)
-		)
-
-	control_chars = CONTROL_CHAR_RE.findall(stripped)
-	if len(control_chars) >= 2:
-		score = min(7, 2 + len(control_chars))
-		findings.append(
-			Finding(
-				line_number=line_number,
-				category="corruption",
-				severity=score_to_severity(score),
-				score=score,
-				timestamp=timestamp_text,
-				matched_phrases=[f"control_chars:{len(control_chars)}"],
-				message=stripped[:240],
-				ip_address=ip_addr,
-			)
-		)
-
-	if len(stripped) > 20000:
-		findings.append(
-			Finding(
-				line_number=line_number,
-				category="corruption",
-				severity="medium",
-				score=4,
-				timestamp=timestamp_text,
-				matched_phrases=["very_long_line"],
-				message=stripped[:240],
-				ip_address=ip_addr,
-			)
-		)
-
-	return findings
 
 
 def detect_time_gap(
@@ -570,18 +476,33 @@ def detect_attack_pattern(error_phrase: str, line_number: int, timestamp_text: s
 	)
 
 
-def _iter_line_batches(handle, chunk_size: int = 4096):
-	batch: list[tuple[int, str]] = []
-	for line_number, line in enumerate(handle, start=1):
-		batch.append((line_number, line))
-		if len(batch) >= chunk_size:
-			yield batch
-			batch = []
-	if batch:
-		yield batch
+def _iter_line_batches(log_path: Path, chunk_size: int = LINE_BATCH_SIZE) -> Iterable[ScanBatch]:
+	with log_path.open("r", encoding="utf-8", errors="replace") as handle:
+		line_number = 1
+		bytes_read = 0
+		while True:
+			raw_lines = list(islice(handle, chunk_size))
+			if not raw_lines:
+				break
+			# TextIO.tell() is unreliable during iterator-based reads on some runtimes.
+			# Track approximate progress using encoded size of consumed lines instead.
+			bytes_read += sum(len(line.encode("utf-8", errors="replace")) for line in raw_lines)
+			batch = [(line_number + offset, line.rstrip("\n")) for offset, line in enumerate(raw_lines)]
+			line_number += len(batch)
+			yield ScanBatch(rows=batch, bytes_read=bytes_read)
 
 
-def scan_log_file(log_path: Path) -> tuple[list[Finding], ScanSummary]:
+def _scan_batch(payload: ScanBatch) -> tuple[list[LineScanResult], int]:
+	return _scan_line_batch(payload.rows), payload.bytes_read
+
+
+def scan_log_file(
+	log_path: Path,
+	collect_findings: bool = True,
+	finding_sink: Callable[[Finding], None] | None = None,
+	workers: int | None = None,
+	progress_callback: Callable[[int, int, int], None] | None = None,
+) -> tuple[list[Finding], ScanSummary]:
 	findings: list[Finding] = []
 	severity_breakdown = {"critical": 0, "high": 0, "medium": 0, "low": 0}
 	category_counts: dict[str, int] = {"malicious": 0, "timestamp": 0, "corruption": 0, "time_gap": 0, "schema": 0, "error_log": 0, "attack_pattern": 0}
@@ -596,8 +517,8 @@ def scan_log_file(log_path: Path) -> tuple[list[Finding], ScanSummary]:
 	error_phrase_last: dict[str, tuple[int, str | None, str | None, str]] = {}
 	time_gap_critical = 0
 	time_gap_high = 0
-	max_workers = max(1, min(4, os.cpu_count() or 1))
-	use_parallel = max_workers > 1
+	total_bytes = log_path.stat().st_size
+	worker_count = max(1, workers if workers is not None else (os.cpu_count() or 1))
 
 	def process_result(result: LineScanResult) -> None:
 		nonlocal previous_timestamp, timestamp_seen, total_lines, structured_lines_seen, common_keys_ready
@@ -654,7 +575,10 @@ def scan_log_file(log_path: Path) -> tuple[list[Finding], ScanSummary]:
 			line_findings.extend(_detect_missing_keys_context(result.line_number, result.timestamp_text, result.ip_address, result.line_snippet, result.line_keys, common_keys))
 
 		for finding in line_findings:
-			findings.append(finding)
+			if collect_findings:
+				findings.append(finding)
+			if finding_sink is not None:
+				finding_sink(finding)
 			severity_breakdown[finding.severity] += 1
 			category_counts[finding.category] = category_counts.get(finding.category, 0) + 1
 			if finding.category == "time_gap":
@@ -667,24 +591,30 @@ def scan_log_file(log_path: Path) -> tuple[list[Finding], ScanSummary]:
 					error_phrase_counts[phrase] = error_phrase_counts.get(phrase, 0) + 1
 					error_phrase_last[phrase] = (result.line_number, result.timestamp_text, result.ip_address, result.line_snippet)
 
-	with open_log_handle(log_path) as handle:
-		batches = _iter_line_batches(handle)
-		if use_parallel:
-			with ProcessPoolExecutor(max_workers=max_workers) as executor:
-				for batch_results in executor.map(_scan_line_batch, batches):
-					for result in batch_results:
-						process_result(result)
-		else:
-			for batch in batches:
-				for result in _scan_line_batch(batch):
+	batch_iter = _iter_line_batches(log_path)
+	if worker_count > 1:
+		with ProcessPoolExecutor(max_workers=worker_count) as executor:
+			for batch_results, bytes_read in executor.map(_scan_batch, batch_iter, chunksize=1):
+				for result in batch_results:
 					process_result(result)
+				if progress_callback is not None:
+					progress_callback(total_lines, bytes_read, total_bytes)
+	else:
+		for batch in batch_iter:
+			for result in _scan_line_batch(batch.rows):
+				process_result(result)
+			if progress_callback is not None:
+				progress_callback(total_lines, batch.bytes_read, total_bytes)
 
 	for phrase, count in error_phrase_counts.items():
 		if count >= 3:
 			line_number, timestamp_text, ip_addr, line_snippet = error_phrase_last[phrase]
 			attack_finding = detect_attack_pattern(phrase, line_number, timestamp_text, line_snippet, count, ip_addr)
 			if attack_finding:
-				findings.append(attack_finding)
+				if collect_findings:
+					findings.append(attack_finding)
+				if finding_sink is not None:
+					finding_sink(attack_finding)
 				severity_breakdown[attack_finding.severity] += 1
 				category_counts[attack_finding.category] = category_counts.get(attack_finding.category, 0) + 1
 

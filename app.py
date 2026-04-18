@@ -8,13 +8,10 @@ import json
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('APP_SECRET_KEY', 'change-this-secret-key')
 
-error_folder = str((Path(__file__).resolve().parent / "error").resolve())
+error_folder = str((Path.home() / "Documents" / "reports").resolve())
 frontend_folder = (Path(__file__).resolve().parent / "frontend").resolve()
-auth_folder = (Path(__file__).resolve().parent / "auth").resolve()
+auth_folder = (Path(__file__).resolve().parent / "private_auth").resolve()
 auth_config_path = auth_folder / "frontend_auth.json"
-
-DEFAULT_USER = "admin"
-DEFAULT_PASS = "admin123"
 
 ALLOWED_EXTENSIONS = {'json'}
 
@@ -30,13 +27,18 @@ def load_json_file(path: Path):
 
 
 def load_frontend_auth():
+	env_user = str(os.environ.get("APP_AUTH_USERNAME") or "").strip()
+	env_pass = str(os.environ.get("APP_AUTH_PASSWORD") or "")
+	if env_user and env_pass:
+		return env_user, env_pass
+
     data = load_json_file(auth_config_path)
     if isinstance(data, dict):
         username = str(data.get('username') or '').strip()
         password = str(data.get('password') or '')
         if username and password:
             return username, password
-    return DEFAULT_USER, DEFAULT_PASS
+    return None
 
 
 def login_required_api(func):
@@ -124,7 +126,12 @@ def frontend_assets(filename):
 def frontend_login():
     username = (request.form.get('username') or '').strip()
     password = request.form.get('password') or ''
-    valid_user, valid_pass = load_frontend_auth()
+    credentials = load_frontend_auth()
+
+    if credentials is None:
+        return jsonify({"detail": "Authentication is not configured"}), 503
+
+    valid_user, valid_pass = credentials
 
     if username == valid_user and password == valid_pass:
         session['authenticated'] = True

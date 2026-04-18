@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import locale
 import math
+import os
+import platform
 import sys
 import textwrap
 from dataclasses import asdict
@@ -24,6 +26,7 @@ except locale.Error:
 	pass
 
 SPARK_CHARS = "▁▂▃▄▅▆▇█"
+SYSTEM_LABEL = f"{platform.system()} {platform.release()} | {platform.machine()} | CPU {os.cpu_count() or '?'}"
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -113,10 +116,10 @@ def _format_count(value: int | float) -> str:
 
 
 def _format_duration(seconds: float | int | None) -> str:
-	if not seconds:
-		return "0s"
-	seconds = int(seconds)
-	days, remainder = divmod(seconds, 86400)
+	seconds_value = max(0.0, float(seconds or 0.0))
+	total_ms = int(round(seconds_value * 1000))
+	whole_seconds, millis = divmod(total_ms, 1000)
+	days, remainder = divmod(whole_seconds, 86400)
 	hours, remainder = divmod(remainder, 3600)
 	minutes, secs = divmod(remainder, 60)
 	parts: list[str] = []
@@ -126,8 +129,8 @@ def _format_duration(seconds: float | int | None) -> str:
 		parts.append(f"{hours}h")
 	if minutes:
 		parts.append(f"{minutes}m")
-	if secs or not parts:
-		parts.append(f"{secs}s")
+	if secs or millis or not parts:
+		parts.append(f"{secs}.{millis:03d}s")
 	return " ".join(parts)
 
 
@@ -321,12 +324,19 @@ def _render_screen(stdscr, model: dict[str, Any]) -> None:
 		f"Lines {summary.get('total_lines', 0)} • Findings {sum(summary.get('severity_breakdown', {}).values())} • Runtime {_format_duration(metrics.get('trend_metadata', {}).get('runtime_seconds', 0))}",
 		color_map["dim"],
 	)
+	_safe_addstr(
+		stdscr,
+		2,
+		2,
+		f"System {SYSTEM_LABEL} • Time Taken {_format_duration(metrics.get('trend_metadata', {}).get('runtime_seconds', 0))}",
+		color_map["dim"],
+	)
 	if max_y < 24 or max_x < 80:
-		_safe_addstr(stdscr, 3, 2, "Enlarge the terminal for the full dashboard.", color_map["dim"])
+		_safe_addstr(stdscr, 4, 2, "Enlarge the terminal for the full dashboard.", color_map["dim"])
 		stdscr.refresh()
 		return
 
-	current_y = 3
+	current_y = 4
 	current_y = _render_metric_cards(stdscr, current_y, max_x - 2, summary, metrics, color_map)
 	content_h = max_y - current_y - 2
 	left_w = max(40, (max_x - 3) // 2)
