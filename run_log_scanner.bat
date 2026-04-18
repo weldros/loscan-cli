@@ -15,12 +15,12 @@ if errorlevel 1 (
 REM Get the directory where this script is located
 set "repo_dir=%~dp0"
 set "repo_dir=%repo_dir:~0,-1%"
-set "error_dir=%repo_dir%\error"
+set "reports_dir=%USERPROFILE%\Documents\reports"
 set "python_script=%repo_dir%\scripts\log_scanner.py"
 
-REM Create error directory if it doesn't exist
-if not exist "%error_dir%" (
-    mkdir "%error_dir%"
+REM Create reports directory if it doesn't exist
+if not exist "%reports_dir%" (
+    mkdir "%reports_dir%"
 )
 
 REM Prompt for log file path
@@ -50,13 +50,18 @@ if not "!report_username!"=="" (
 
 REM Prompt for output formats — pre-initialize to empty so Enter works
 set "formats="
-set /p "formats=Enter output formats (json,csv,html,yaml,db) or leave blank for all: "
+set /p "formats=Enter output formats (json,csv,html,db) or leave blank for all: "
+set "web_choice="
+set /p "web_choice=Enable web output (DB/auth)? [y/N]: "
+set "web_flag="
+if /I "!web_choice!"=="y" set "web_flag=--web"
+if /I "!web_choice!"=="yes" set "web_flag=--web"
 
 REM Call Python CLI
 if "!formats!"=="" (
-    python3 "!python_script!" "!log_file!" --output-dir "!error_dir!" --tui !extra_args!
+    python3 "!python_script!" "!log_file!" --output-dir "!reports_dir!" --tui !web_flag! !extra_args!
 ) else (
-    python3 "!python_script!" "!log_file!" --output-dir "!error_dir!" --formats "!formats!" --tui !extra_args!
+    python3 "!python_script!" "!log_file!" --output-dir "!reports_dir!" --formats "!formats!" --tui !web_flag! !extra_args!
 )
 
 echo.

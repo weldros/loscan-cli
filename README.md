@@ -1,11 +1,11 @@
 # Log Scanner
 
-A high-performance log file scanner that detects malicious patterns, missing timestamps, corruption, and time-gaps in large log files. Generates reports in multiple formats (JSON, CSV, HTML, YAML, SQLite).
+A high-performance log file scanner that detects malicious patterns, missing timestamps, corruption, and time-gaps in large log files. Generates reports in multiple formats (JSON, CSV, HTML, SQLite).
 
 ## Features
 
 - **Single-pass streaming scan** — processes 1M+ line files in seconds
-- **Multi-format exports** — JSON, CSV, HTML, YAML, SQLite database
+- **Multi-format exports** — JSON, CSV, HTML, SQLite database
 - **Pattern detection**:
   - Malicious patterns (SQL injection, command injection, XSS, path traversal)
   - Error keywords (error, failed, fatal, panic, denied, unauthorized, etc.)
@@ -25,7 +25,7 @@ Then enter:
 1. Path to your .log file
 2. Desired output formats (e.g., `json,csv` or leave blank for all)
 
-Reports are saved to the `error/` directory.
+Reports are saved to `~/Documents/reports`.
 
 ### Windows (PowerShell)
 ```powershell
@@ -58,18 +58,18 @@ chmod +x run_log_scanner.sh  # On Linux/macOS only
 ```bash
 $ bash run_log_scanner.sh
 Enter path to .log file: /var/log/apache/access.log
-Enter output formats (json,csv,html,yaml,db) or leave blank for all: json,csv
+Enter output formats (json,csv,html,db) or leave blank for all: json,csv
 # Generates:
-# - error/access.log_report.json
-# - error/access.log_report.csv
+# - ~/Documents/reports/access.log_report.json
+# - ~/Documents/reports/access.log_report.csv
 ```
 
 **PowerShell:**
 ```powershell
 PS> powershell -ExecutionPolicy Bypass -File run_log_scanner.ps1
 Enter path to .log file: C:\Logs\app.log
-Enter output formats (json,csv,html,yaml,db) or leave blank for all:
-# Generates all 5 formats (default when blank)
+Enter output formats (json,csv,html,db) or leave blank for all:
+# Generates all 4 formats (default when blank)
 ```
 
 ## Output Formats
@@ -79,7 +79,6 @@ Enter output formats (json,csv,html,yaml,db) or leave blank for all:
 | **JSON** | Structured data, API integration, web uploads |
 | **CSV** | Spreadsheet analysis, filtering |
 | **HTML** | Visual inspection, sharing reports |
-| **YAML** | Configuration, compact readability (auto-generated only if <250KB) |
 | **SQLite (.db)** | Time-series graphing, timeline bucketing, backend ingestion |
 
 ## Report Structure
@@ -101,18 +100,17 @@ run_log_scanner.{sh,ps1,bat}  ← User entry point (interactive prompts)
 scripts/log_scanner.py  ← CLI orchestrator
   ├─ scripts/scanner_core.py  ← Streaming scan engine
   └─ scripts/reporting.py  ← Multi-format exporter
-        ├─→ error/report.json
-        ├─→ error/report.csv
-        ├─→ error/report.html
-        ├─→ error/report.yaml (if <250KB)
-        └─→ error/report.db (SQLite)
+  ├─→ ~/Documents/reports/report.json
+  ├─→ ~/Documents/reports/report.csv
+  ├─→ ~/Documents/reports/report.html
+  └─→ ~/Documents/reports/report.db (SQLite)
 ```
 
 ## Advanced Usage
 
 ### Command-line Direct (Skip Interactive Prompts)
 ```bash
-python3 scripts/log_scanner.py /path/to/logfile.log --output-dir ./error --formats json,csv
+python3 scripts/log_scanner.py /path/to/logfile.log --output-dir ~/Documents/reports --formats json,csv
 ```
 
 ### Terminal Dashboard
@@ -126,14 +124,13 @@ python3 scripts/log_scanner.py /path/to/logfile.log --tui
 Or open it directly from the generated metrics artifact:
 
 ```bash
-python3 scripts/tui_dashboard.py error/logfile_error_report_dashboard_metrics.json
+python3 scripts/tui_dashboard.py ~/Documents/reports/logfile_error_report_dashboard_metrics.json
 ```
 
 ### Supported Format Values
 - `json` — JSON export
 - `csv` — CSV export
 - `html` — HTML export
-- `yaml` — YAML export
 - `db` — SQLite database export
 
 Leave `--formats` empty or omit to generate all formats.
