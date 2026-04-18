@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, Iterable
 
+#pattern detection block
 MALICIOUS_PATTERNS: list[tuple[str, re.Pattern[str], str, int]] = [
 	(
 		"sql_injection",
@@ -37,6 +38,7 @@ MALICIOUS_PATTERNS: list[tuple[str, re.Pattern[str], str, int]] = [
 	),
 ]
 
+#timestamp recognition
 TIMESTAMP_PATTERNS: list[re.Pattern[str]] = [
 	re.compile(r"^\s*\[([A-Z][a-z]{2}\s+[A-Z][a-z]{2}\s+\d{1,2}\s\d{2}:\d{2}:\d{2}\s\d{4})\]"),
 	re.compile(r"^\s*([A-Z][a-z]{2}\s+[A-Z][a-z]{2}\s+\d{1,2}\s\d{2}:\d{2}:\d{2}\s\d{4})"),
@@ -96,7 +98,6 @@ ERROR_KEYWORDS = {
 	"timeout",
 	"corrupt",
 	"unavailable",
-	"not",
 	"unable",
 	"retry",
 	"disconnect",
@@ -108,6 +109,7 @@ ERROR_KEYWORDS = {
 
 WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.:-]{1,}")
 IP_RE = re.compile(r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b")
+LOCAL_IP_EXCEPTIONS = {"127.0.0.1", "0.0.0.0"}
 ENABLE_OUT_OF_ORDER_TIMESTAMP = False
 TIME_GAP_THRESHOLD_HIGH = timedelta(seconds=300)
 TIME_GAP_THRESHOLD_CRITICAL = timedelta(seconds=500)
@@ -139,10 +141,10 @@ for _phrase in ERROR_KEYPHRASES:
 @dataclass
 class Finding:
 	line_number: int
-	category: str
+	timestamp: str | None
 	severity: str
 	score: int
-	timestamp: str | None
+	category: str
 	matched_phrases: list[str]
 	message: str
 	ip_address: str | None = None
@@ -236,8 +238,8 @@ def extract_words(line: str) -> set[str]:
 
 
 def extract_all_ips(line: str) -> str | None:
-	"""Extract all IPv4 addresses found in the line, return comma-separated string."""
-	matches = IP_RE.findall(line)
+	"""Extract all non-exception IPv4 addresses from the line, as a comma-separated string."""
+	matches = [ip for ip in IP_RE.findall(line) if ip not in LOCAL_IP_EXCEPTIONS]
 	if matches:
 		return ",".join(sorted(set(matches)))  # unique IPs in stable order
 	return None
@@ -460,8 +462,8 @@ def detect_time_gap(
 
 
 def detect_attack_pattern(error_phrase: str, line_number: int, timestamp_text: str | None, line_snippet: str, phrase_count: int, ip_addr: str | None) -> Finding | None:
-	"""Detect if an error phrase appears frequently (3+ times), flagging as potential attack."""
-	if phrase_count < 3:
+	"""Detect if an error phrase appears frequently (10+ times), flagging as potential attack."""
+	if phrase_count < 10:
 		return None
 
 	return Finding(

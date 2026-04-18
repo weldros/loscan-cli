@@ -255,14 +255,19 @@ def _render_table_panel(win, y: int, x: int, h: int, w: int, title: str, rows: l
 
 def _format_top_ip_rows(metrics: dict[str, Any]) -> list[tuple[str, str, str]]:
 	rows: list[tuple[str, str, str]] = []
-	for item in (metrics.get("ip_request_metrics", []) or [])[:6]:
+	for item in (metrics.get("ip_request_metrics", []) or []):
+		total_requests = int(item.get("total_requests", 0))
+		if total_requests <= 10:
+			continue
 		rows.append(
 			(
 				str(item.get("ip_address", "")),
 				f"malicious {int(item.get('malicious_request_count', 0))}",
-				f"req {int(item.get('total_requests', 0))}",
+				f"req {total_requests}",
 			)
 		)
+		if len(rows) >= 6:
+			break
 	return rows
 
 
