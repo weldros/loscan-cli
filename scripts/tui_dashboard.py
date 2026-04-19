@@ -294,7 +294,7 @@ def _render_malicious_ip_panel(win, y: int, x: int, h: int, w: int, metrics: dic
 		return
 
 	max_hits = max(1, max(int(row.get("malicious_request_count", 0)) for row in top_rows))
-	hits_col_w = max(2, max(len(str(int(row.get("malicious_request_count", 0)))) for row in top_rows))
+	hits_col_w = max(6, max(len(f"{int(row.get('malicious_request_count', 0))} hits") for row in top_rows))
 	label_w = max(12, min(24, w // 2))
 	bar_x = x + 2 + label_w
 	bar_w = max(6, w - label_w - hits_col_w - 8)
@@ -305,9 +305,53 @@ def _render_malicious_ip_panel(win, y: int, x: int, h: int, w: int, metrics: dic
 			break
 		ip = str(row.get("ip_address", "unknown"))
 		hits = int(row.get("malicious_request_count", 0))
-		hits_text = str(hits)
+		hits_text = f"{hits} hits"
 		ratio = hits / max_hits
 		_safe_addstr(win, line_y, x + 2, textwrap.shorten(f"{idx + 1}. {ip}", width=label_w, placeholder="..."), color_map["text"] | curses.A_BOLD)
+		_draw_meter(win, line_y, bar_x, bar_w, ratio, color_map["high"])
+		hits_x = min(x + w - 2 - len(hits_text), bar_x + bar_w + 3)
+		_safe_addstr(win, line_y, max(bar_x + 2, hits_x), hits_text, color_map["dim"])
+
+
+def _get_top_time_gaps(metrics: dict[str, Any], limit: int = 5) -> list[dict[str, Any]]:
+	time_gaps = metrics.get("top_time_gaps", []) or []
+	rows = sorted(
+		time_gaps,
+		key=lambda row: (
+			int(row.get("gap_seconds", 0)),
+			int(row.get("line_number", 0)),
+		),
+		reverse=True,
+	)
+	return rows[:limit]
+
+
+def _render_time_gap_panel(win, y: int, x: int, h: int, w: int, metrics: dict[str, Any], color_map: dict[str, int]) -> None:
+	_draw_box(win, y, x, h, w, "Top Time Gaps", color_map["panel"])
+	top_rows = _get_top_time_gaps(metrics, limit=5)
+	total_gaps = int(metrics.get("trend_metadata", {}).get("time_gap_count_gt300", 0) or 0)
+	_safe_addstr(win, y + 1, x + 2, f"Total time-gap hits: {_format_count(total_gaps)}", color_map["accent"] | curses.A_BOLD)
+
+	if not top_rows:
+		_safe_addstr(win, y + 3, x + 2, "No time gaps", color_map["dim"])
+		return
+
+	max_gap = max(1, max(int(row.get("gap_seconds", 0)) for row in top_rows))
+	gap_value_w = max(8, max(len(f"{int(row.get('gap_seconds', 0))} seconds") for row in top_rows))
+	label_w = max(14, min(28, w // 2))
+	bar_x = x + 2 + label_w
+	bar_w = max(6, w - label_w - gap_value_w - 8)
+
+	for idx, row in enumerate(top_rows):
+		line_y = y + 3 + idx * 2
+		if line_y >= y + h - 1:
+			break
+		range_start = str(row.get("range_start") or "unknown")
+		gap_seconds = int(row.get("gap_seconds", 0))
+		hits_text = f"{gap_seconds} seconds"
+		ratio = gap_seconds / max_gap
+		label = f"{idx + 1}. {range_start}"
+		_safe_addstr(win, line_y, x + 2, textwrap.shorten(label, width=label_w, placeholder="..."), color_map["text"] | curses.A_BOLD)
 		_draw_meter(win, line_y, bar_x, bar_w, ratio, color_map["high"])
 		hits_x = min(x + w - 2 - len(hits_text), bar_x + bar_w + 3)
 		_safe_addstr(win, line_y, max(bar_x + 2, hits_x), hits_text, color_map["dim"])
@@ -407,6 +451,7 @@ def _render_screen(stdscr, model: dict[str, Any]) -> None:
 			malicious_h = 5 if not top_rows else (2 * len(top_rows) + 3)
 			malicious_h = min(lower_h, max(5, malicious_h))
 			_render_malicious_ip_panel(stdscr, lower_y, left_x, malicious_h, left_w, metrics, color_map)
+			_render_time_gap_panel(stdscr, lower_y, right_x, malicious_h, right_w, metrics, color_map)
 	else:
 		_safe_addstr(stdscr, current_y, 2, "Terminal too small for dashboard sections.", color_map["dim"])
 

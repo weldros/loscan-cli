@@ -162,6 +162,7 @@ class DashboardMetricAccumulator:
 	ip_stats: dict[str, dict[str, Any]] = field(default_factory=dict)
 	ip_category_counts: dict[tuple[str, str], int] = field(default_factory=lambda: defaultdict(int))
 	error_phrase_counts: dict[str, int] = field(default_factory=lambda: defaultdict(int))
+	time_gap_records: list[dict[str, Any]] = field(default_factory=list)
 	malicious_pattern_counts: dict[str, int] = field(default_factory=lambda: defaultdict(int))
 	top_attack_patterns: list[str] = field(default_factory=list)
 
@@ -204,6 +205,26 @@ class DashboardMetricAccumulator:
 
 		for phrase in finding.matched_phrases:
 			self.error_phrase_counts[phrase] += 1
+
+		if finding.category == "time_gap":
+			range_start = None
+			range_end = None
+			for phrase in finding.matched_phrases:
+				if phrase.startswith("gap_range:"):
+					range_text = phrase[len("gap_range:") :]
+					if "->" in range_text:
+						range_start, range_end = range_text.split("->", 1)
+						break
+			self.time_gap_records.append(
+				{
+					"line_number": finding.line_number,
+					"gap_seconds": _extract_gap_seconds(finding),
+					"range_start": range_start,
+					"range_end": range_end,
+					"severity": finding.severity,
+					"message": finding.message,
+				}
+			)
 
 		if finding.category == "malicious" and finding.matched_phrases:
 			attack_label = MALICIOUS_PATTERN_LABELS.get(finding.matched_phrases[0], finding.matched_phrases[0])
@@ -278,6 +299,21 @@ class DashboardMetricAccumulator:
 			{"ip_address": ip, "category": category, "occurrences": count}
 			for (ip, category), count in sorted(self.ip_category_counts.items(), key=lambda item: item[1], reverse=True)
 		]
+		top_time_gaps = [
+			{
+				"line_number": item["line_number"],
+				"gap_seconds": item["gap_seconds"],
+				"range_start": item["range_start"],
+				"range_end": item["range_end"],
+				"severity": item["severity"],
+				"message": item["message"],
+			}
+			for item in sorted(
+				self.time_gap_records,
+				key=lambda item: (item["gap_seconds"], item["line_number"]),
+				reverse=True,
+			)[:5]
+		]
 
 		total_downtime_seconds = sum(bucket["downtime_seconds"] for bucket in buckets)
 		availability_percent = 100.0
@@ -314,10 +350,12 @@ class DashboardMetricAccumulator:
 			},
 			"error_phrase_frequency": error_phrase_frequency,
 			"ip_error_correlation": ip_error_correlation,
+			"top_time_gaps": top_time_gaps,
 			"top_findings": {
 				"top_ips": ip_metrics[:10],
 				"top_error_phrases": error_phrase_frequency[:10],
 				"top_attack_patterns": self.top_attack_patterns,
+				"top_time_gaps": top_time_gaps,
 			},
 		}
 
