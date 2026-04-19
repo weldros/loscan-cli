@@ -118,9 +118,9 @@ COMMON_KEY_MIN_LINES = 5
 LINE_BATCH_SIZE = 4096
 
 HIGH_SEVERITY_ERROR_TERMS = {
-	"error",
-	"failed",
-	"failure",
+	# "error",
+	# "failed",
+	# "failure",
 	"fatal",
 	"critical",
 	"panic",
@@ -433,6 +433,7 @@ def detect_time_gap(
 		return []
 
 	seconds = int(delta.total_seconds())
+	range_label = f"gap_range:{previous_timestamp.isoformat()}->{current_timestamp.isoformat()}"
 
 	if delta >= TIME_GAP_THRESHOLD_CRITICAL:
 		return [
@@ -442,7 +443,7 @@ def detect_time_gap(
 				severity="critical",
 				score=9,
 				timestamp=timestamp_text,
-				matched_phrases=[f"gap>{int(delta.total_seconds())}sec"],
+				matched_phrases=[range_label, f"gap>{int(delta.total_seconds())}sec"],
 				message=f"CRITICAL time gap: {seconds} second(s) - potential malicious activity detected",
 				ip_address=ip_addr,
 			)
@@ -455,7 +456,7 @@ def detect_time_gap(
 				severity="high",
 				score=7,
 				timestamp=timestamp_text,
-				matched_phrases=[f"gap>{int(delta.total_seconds())}sec"],
+				matched_phrases=[range_label, f"gap>{int(delta.total_seconds())}sec"],
 				message=f"Suspicious time gap: {seconds} second(s) since previous log entry",
 				ip_address=ip_addr,
 			)
