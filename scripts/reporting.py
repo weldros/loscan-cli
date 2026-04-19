@@ -13,11 +13,29 @@ from html import escape
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from scanner_core import Finding, ScanSummary, parse_timestamp_text
+from scanner_core import MALICIOUS_PATTERNS, Finding, ScanSummary, parse_timestamp_text
 
 SUPPORTED_FORMATS = ("json", "csv", "html", "db")
 DASHBOARD_INTERVAL_COUNT = 12
 MALICIOUS_IP_CATEGORIES = {"malicious", "attack_pattern", "time_gap"}
+
+
+def _format_attack_label(pattern_name: str) -> str:
+	if pattern_name == "sql_injection":
+		return "SQL injection"
+	if pattern_name == "command_injection":
+		return "command injection"
+	if pattern_name == "path_traversal":
+		return "path traversal"
+	if pattern_name == "xss_payload":
+		return "XSS payload"
+	return pattern_name.replace("_", " ")
+
+
+MALICIOUS_PATTERN_LABELS = {
+	reason: _format_attack_label(pattern_name)
+	for pattern_name, _, reason, _ in MALICIOUS_PATTERNS
+}
 
 
 def default_error_report_dir(log_path: Path) -> Path:
@@ -144,6 +162,7 @@ class DashboardMetricAccumulator:
 	ip_stats: dict[str, dict[str, Any]] = field(default_factory=dict)
 	ip_category_counts: dict[tuple[str, str], int] = field(default_factory=lambda: defaultdict(int))
 	error_phrase_counts: dict[str, int] = field(default_factory=lambda: defaultdict(int))
+	malicious_pattern_counts: dict[str, int] = field(default_factory=lambda: defaultdict(int))
 	top_attack_patterns: list[str] = field(default_factory=list)
 
 	def consume(self, finding: Finding) -> None:
@@ -185,6 +204,10 @@ class DashboardMetricAccumulator:
 
 		for phrase in finding.matched_phrases:
 			self.error_phrase_counts[phrase] += 1
+
+		if finding.category == "malicious" and finding.matched_phrases:
+			attack_label = MALICIOUS_PATTERN_LABELS.get(finding.matched_phrases[0], finding.matched_phrases[0])
+			self.malicious_pattern_counts[attack_label] += 1
 
 		if finding.category == "attack_pattern" and len(self.top_attack_patterns) < 10:
 			self.top_attack_patterns.append(finding.message)
@@ -239,6 +262,14 @@ class DashboardMetricAccumulator:
 			key=lambda item: (item["malicious_request_count"], item["total_requests"], item["critical_findings"]),
 			reverse=True,
 		)
+		top_attack_conclusion = None
+		top_attack_count = 0
+		if self.malicious_pattern_counts:
+			top_attack_conclusion, top_attack_count = sorted(
+				self.malicious_pattern_counts.items(),
+				key=lambda item: (item[1], item[0]),
+				reverse=True,
+			)[0]
 		error_phrase_frequency = [
 			{"phrase": phrase, "occurrences": count}
 			for phrase, count in sorted(self.error_phrase_counts.items(), key=lambda item: item[1], reverse=True)
@@ -268,6 +299,8 @@ class DashboardMetricAccumulator:
 				"availability_percent": availability_percent,
 				"time_gap_count_gt500": summary.time_gap_count_gt500,
 				"time_gap_count_gt300": summary.time_gap_count_gt300,
+				"top_attack_conclusion": top_attack_conclusion,
+				"top_attack_count": top_attack_count,
 			},
 			"time_series": buckets,
 			"uptime_trend": [
