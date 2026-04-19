@@ -164,7 +164,7 @@ def _render_metric_cards(win, start_y: int, width: int, summary: dict[str, Any],
 	cards = [
 		("Lines", _format_count(summary.get("total_lines", 0)), "scanned"),
 		("Findings", _format_count(sum(summary.get("severity_breakdown", {}).values())), "all severities"),
-		("Runtime", _format_duration(metrics.get("trend_metadata", {}).get("runtime_seconds", 0)), "scan window"),
+		("Log Runtime", _format_duration(metrics.get("trend_metadata", {}).get("log_span_seconds", 0)), "log span"),
 		("Availability", f"{metrics.get('trend_metadata', {}).get('availability_percent', 100.0):.2f}%", "from timeline"),
 	]
 	card_width = max(18, (width - 5) // 4)
@@ -250,12 +250,17 @@ def _render_table_panel(win, y: int, x: int, h: int, w: int, title: str, rows: l
 			break
 		_safe_addstr(win, row_y, x + 2, textwrap.shorten(left, width=max(8, w // 3), placeholder="…"), color_map["text"] | curses.A_BOLD)
 		_safe_addstr(win, row_y, x + max(12, w // 2), textwrap.shorten(middle, width=max(8, w // 3), placeholder="…"), color_map["accent"])
-		_safe_addstr(win, row_y, x + w - max(12, len(right) + 3), textwrap.shorten(right, width=max(10, w // 4), placeholder="…"), color_map["dim"])
+		if right:
+			_safe_addstr(win, row_y, x + w - max(12, len(right) + 3), textwrap.shorten(right, width=max(10, w // 4), placeholder="…"), color_map["dim"])
 
 
 def _format_top_ip_rows(metrics: dict[str, Any]) -> list[tuple[str, str, str]]:
 	rows: list[tuple[str, str, str]] = []
-	for item in (metrics.get("ip_request_metrics", []) or []):
+	for item in sorted(
+		(metrics.get("ip_request_metrics", []) or []),
+		key=lambda row: (int(row.get("total_requests", 0)), int(row.get("malicious_request_count", 0))),
+		reverse=True,
+	):
 		total_requests = int(item.get("total_requests", 0))
 		if total_requests <= 10:
 			continue
@@ -274,7 +279,7 @@ def _format_top_ip_rows(metrics: dict[str, Any]) -> list[tuple[str, str, str]]:
 def _format_phrase_rows(metrics: dict[str, Any]) -> list[tuple[str, str, str]]:
 	rows: list[tuple[str, str, str]] = []
 	for item in (metrics.get("error_phrase_frequency", []) or [])[:6]:
-		rows.append((str(item.get("phrase", "")), f"{int(item.get('occurrences', 0))} hits", "error phrase"))
+		rows.append((str(item.get("phrase", "")), f"{int(item.get('occurrences', 0))} hits", ""))
 	return rows
 
 
@@ -326,7 +331,7 @@ def _render_screen(stdscr, model: dict[str, Any]) -> None:
 		stdscr,
 		1,
 		2,
-		f"Lines {summary.get('total_lines', 0)} • Findings {sum(summary.get('severity_breakdown', {}).values())} • Runtime {_format_duration(metrics.get('trend_metadata', {}).get('runtime_seconds', 0))}",
+		f"Lines {summary.get('total_lines', 0)} • Findings {sum(summary.get('severity_breakdown', {}).values())} • Log Runtime {_format_duration(metrics.get('trend_metadata', {}).get('log_span_seconds', 0))}",
 		color_map["dim"],
 	)
 	_safe_addstr(
@@ -337,11 +342,11 @@ def _render_screen(stdscr, model: dict[str, Any]) -> None:
 		color_map["dim"],
 	)
 	if max_y < 24 or max_x < 80:
-		_safe_addstr(stdscr, 4, 2, "Enlarge the terminal for the full dashboard.", color_map["dim"])
+		_safe_addstr(stdscr, 5, 2, "Enlarge the terminal for the full dashboard.", color_map["dim"])
 		stdscr.refresh()
 		return
 
-	current_y = 4
+	current_y = 5
 	current_y = _render_metric_cards(stdscr, current_y, max_x - 2, summary, metrics, color_map)
 	content_h = max_y - current_y - 2
 	left_w = max(40, (max_x - 3) // 2)
