@@ -151,7 +151,7 @@ def _extract_gap_seconds(finding: Finding) -> int:
 
 
 def _is_malicious_for_ip(finding: Finding) -> bool:
-	return finding.category in MALICIOUS_IP_CATEGORIES or finding.severity == "critical"
+	return finding.category == "error_log"
 
 
 @dataclass
