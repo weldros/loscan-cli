@@ -160,23 +160,37 @@ def _draw_meter(win, y: int, x: int, width: int, ratio: float, color: int) -> No
 	_safe_addstr(win, y, x + width + 1, "]", curses.A_DIM)
 
 
-def _render_metric_cards(win, start_y: int, width: int, summary: dict[str, Any], metrics: dict[str, Any], color_map: dict[str, int]) -> int:
-	cards = [
+def _render_metric_cards(
+	win,
+	start_y: int,
+	width: int,
+	summary: dict[str, Any],
+	metrics: dict[str, Any],
+	color_map: dict[str, int],
+	cards: list[tuple[str, str, str]] | None = None,
+) -> int:
+	if cards is None:
+		cards = [
 		("Lines", _format_count(summary.get("total_lines", 0)), "scanned"),
 		("Findings", _format_count(sum(summary.get("severity_breakdown", {}).values())), "all severities"),
 		("Log Runtime", _format_duration(metrics.get("trend_metadata", {}).get("log_span_seconds", 0)), "log span"),
 		("Availability", f"{metrics.get('trend_metadata', {}).get('availability_percent', 100.0):.2f}%", "from timeline"),
-	]
-	card_width = max(18, (width - 5) // 4)
+		]
+	cards_per_row = max(1, len(cards))
+	card_width = max(18, (width - (cards_per_row + 1)) // cards_per_row)
 	height = 5
 	for idx, (label, value, note) in enumerate(cards):
-		x = 1 + idx * (card_width + 1)
+		row = idx // cards_per_row
+		col = idx % cards_per_row
+		x = 1 + col * (card_width + 1)
+		y = start_y + row * (height + 1)
 		if x + card_width >= width:
 			break
-		_draw_box(win, start_y, x, height, card_width, label, color_map["panel"])
-		_safe_addstr(win, start_y + 1, x + 2, value, color_map["accent"] | curses.A_BOLD)
-		_safe_addstr(win, start_y + 2, x + 2, note, color_map["dim"])
-	return start_y + height + 1
+		_draw_box(win, y, x, height, card_width, label, color_map["panel"])
+		_safe_addstr(win, y + 1, x + 2, value, color_map["accent"] | curses.A_BOLD)
+		_safe_addstr(win, y + 2, x + 2, note, color_map["dim"])
+	row_count = (len(cards) + cards_per_row - 1) // cards_per_row
+	return start_y + (row_count * (height + 1))
 
 
 def _render_severity_panel(win, y: int, x: int, h: int, w: int, summary: dict[str, Any], color_map: dict[str, int]) -> None:
@@ -254,33 +268,49 @@ def _render_table_panel(win, y: int, x: int, h: int, w: int, title: str, rows: l
 			_safe_addstr(win, row_y, x + w - max(12, len(right) + 3), textwrap.shorten(right, width=max(10, w // 4), placeholder="…"), color_map["dim"])
 
 
-def _format_top_ip_rows(metrics: dict[str, Any]) -> list[tuple[str, str, str]]:
-	rows: list[tuple[str, str, str]] = []
-	for item in sorted(
-		(metrics.get("ip_request_metrics", []) or []),
-		key=lambda row: (int(row.get("total_requests", 0)), int(row.get("malicious_request_count", 0))),
+def _get_top_malicious_ips(metrics: dict[str, Any], limit: int = 5) -> tuple[int, list[dict[str, Any]]]:
+	ip_metrics = metrics.get("ip_request_metrics", []) or []
+	rows = sorted(
+		ip_metrics,
+		key=lambda row: (
+			int(row.get("malicious_request_count", 0)),
+			int(row.get("total_requests", 0)),
+			str(row.get("ip_address", "")),
+		),
 		reverse=True,
-	):
-		total_requests = int(item.get("total_requests", 0))
-		if total_requests <= 10:
-			continue
-		rows.append(
-			(
-				str(item.get("ip_address", "")),
-				f"malicious {int(item.get('malicious_request_count', 0))}",
-				f"req {total_requests}",
-			)
-		)
-		if len(rows) >= 6:
+	)
+	top_rows = [row for row in rows if int(row.get("malicious_request_count", 0)) > 0][:limit]
+	total_hits = sum(int(row.get("malicious_request_count", 0)) for row in rows)
+	return total_hits, top_rows
+
+
+def _render_malicious_ip_panel(win, y: int, x: int, h: int, w: int, metrics: dict[str, Any], color_map: dict[str, int]) -> None:
+	_draw_box(win, y, x, h, w, "Malicious IP Hits", color_map["panel"])
+	total_hits, top_rows = _get_top_malicious_ips(metrics, limit=5)
+	_safe_addstr(win, y + 1, x + 2, f"Total malicious IP hits: {_format_count(total_hits)}", color_map["accent"] | curses.A_BOLD)
+
+	if not top_rows:
+		_safe_addstr(win, y + 3, x + 2, "No malicious IP hits", color_map["dim"])
+		return
+
+	max_hits = max(1, max(int(row.get("malicious_request_count", 0)) for row in top_rows))
+	hits_col_w = max(2, max(len(str(int(row.get("malicious_request_count", 0)))) for row in top_rows))
+	label_w = max(12, min(24, w // 2))
+	bar_x = x + 2 + label_w
+	bar_w = max(6, w - label_w - hits_col_w - 8)
+
+	for idx, row in enumerate(top_rows):
+		line_y = y + 3 + idx * 2
+		if line_y >= y + h - 1:
 			break
-	return rows
-
-
-def _format_phrase_rows(metrics: dict[str, Any]) -> list[tuple[str, str, str]]:
-	rows: list[tuple[str, str, str]] = []
-	for item in (metrics.get("error_phrase_frequency", []) or [])[:6]:
-		rows.append((str(item.get("phrase", "")), f"{int(item.get('occurrences', 0))} hits", ""))
-	return rows
+		ip = str(row.get("ip_address", "unknown"))
+		hits = int(row.get("malicious_request_count", 0))
+		hits_text = str(hits)
+		ratio = hits / max_hits
+		_safe_addstr(win, line_y, x + 2, textwrap.shorten(f"{idx + 1}. {ip}", width=label_w, placeholder="..."), color_map["text"] | curses.A_BOLD)
+		_draw_meter(win, line_y, bar_x, bar_w, ratio, color_map["high"])
+		hits_x = min(x + w - 2 - len(hits_text), bar_x + bar_w + 3)
+		_safe_addstr(win, line_y, max(bar_x + 2, hits_x), hits_text, color_map["dim"])
 
 
 def _build_model(metrics_path: Path, report_path: Path | None, summary: ScanSummary | None, footer_message: str) -> dict[str, Any]:
@@ -347,12 +377,25 @@ def _render_screen(stdscr, model: dict[str, Any]) -> None:
 		return
 
 	current_y = 5
-	current_y = _render_metric_cards(stdscr, current_y, max_x - 2, summary, metrics, color_map)
-	content_h = max_y - current_y - 2
 	left_w = max(40, (max_x - 3) // 2)
 	right_w = max_x - left_w - 3
 	left_x = 1
 	right_x = left_x + left_w + 1
+	series = metrics.get("uptime_trend", []) or []
+	trend_values = [float(point.get("uptime_percent", 0.0)) for point in series]
+	trend_value = _sparkline(trend_values) if trend_values else "No trend data"
+	trend_note = "time trend"
+	if trend_values:
+		trend_note = f"min {min(trend_values):.1f}%  max {max(trend_values):.1f}%"
+	top_cards = [
+		("Lines", _format_count(summary.get("total_lines", 0)), "scanned"),
+		("Findings", _format_count(sum(summary.get("severity_breakdown", {}).values())), "all severities"),
+		("Log Runtime", _format_duration(metrics.get("trend_metadata", {}).get("log_span_seconds", 0)), "log span"),
+		("Availability", f"{metrics.get('trend_metadata', {}).get('availability_percent', 100.0):.2f}%", "from timeline"),
+		("Uptime Trend", trend_value, trend_note),
+	]
+	current_y = _render_metric_cards(stdscr, current_y, max_x - 2, summary, metrics, color_map, cards=top_cards)
+	content_h = max_y - current_y - 2
 	if content_h >= 12:
 		left_top_h = max(8, min(12, content_h // 2 + 1))
 		_render_severity_panel(stdscr, current_y, left_x, left_top_h, left_w, summary, color_map)
@@ -360,14 +403,10 @@ def _render_screen(stdscr, model: dict[str, Any]) -> None:
 		lower_y = current_y + left_top_h + 1
 		lower_h = max_y - lower_y - 2
 		if lower_h >= 7:
-			trend_h = 5
-			_render_trend_panel(stdscr, lower_y, left_x, trend_h, left_w, metrics, color_map)
-			ip_rows = _format_top_ip_rows(metrics)
-			phrase_rows = _format_phrase_rows(metrics)
-			_render_table_panel(stdscr, lower_y, right_x, max(5, trend_h), right_w, "Top IPs", ip_rows, color_map)
-			phrase_y = lower_y + max(5, trend_h) + 1
-			if phrase_y + 5 < max_y - 1:
-				_render_table_panel(stdscr, phrase_y, right_x, 5, right_w, "Top Error Phrases", phrase_rows, color_map)
+			_, top_rows = _get_top_malicious_ips(metrics, limit=5)
+			malicious_h = 5 if not top_rows else (2 * len(top_rows) + 3)
+			malicious_h = min(lower_h, max(5, malicious_h))
+			_render_malicious_ip_panel(stdscr, lower_y, left_x, malicious_h, left_w, metrics, color_map)
 	else:
 		_safe_addstr(stdscr, current_y, 2, "Terminal too small for dashboard sections.", color_map["dim"])
 
